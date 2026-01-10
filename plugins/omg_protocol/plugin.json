@@ -1,0 +1,13 @@
+{
+  "entry": "__init__.py",
+  "meta": {
+    "id": "5B513D2D-819A-8552-7672-7F033EC3E0AD",
+    "name": "OMG Protocol",
+    "description": "欧买噶服务器协议",
+    "author": "Murphy",
+    "version": "1.0.0",
+    "dependencies": [
+      "A03D8FB4-2672-2A94-49DB-D5C0A0F447DB"
+    ]
+  }
+}

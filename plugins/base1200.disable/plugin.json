@@ -1,0 +1,10 @@
+{
+  "entry": "__init__.py",
+  "meta": {
+    "id": "36D701B3-6E98-3E92-AF53-C4EC327B3A71",
+    "name": "Base1200",
+    "description": "1.20+ 事件/插件消息桥接",
+    "author": "Murphy",
+    "version": "1.0.0"
+  }
+}

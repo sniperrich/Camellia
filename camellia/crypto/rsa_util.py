@@ -1,7 +1,11 @@
 import base64
 import os
+import sys
 from dataclasses import dataclass
 from typing import Optional
+
+os.environ.setdefault("PYCRYPTODOME_DISABLE_GMP", "1")
+os.environ.setdefault("CONDA_PREFIX", sys.prefix)
 
 try:
     from Crypto.PublicKey import RSA

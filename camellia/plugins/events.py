@@ -26,6 +26,21 @@ class PluginMessageEvent(BaseEvent):
 
 
 @dataclass
+class ChatMessageEvent(BaseEvent):
+    message: str = ""
+
+
+@dataclass
+class PlayerPositionEvent(BaseEvent):
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    yaw: float = 0.0
+    pitch: float = 0.0
+    on_ground: bool = False
+
+
+@dataclass
 class AnimationEvent(BaseEvent):
     pass
 
@@ -99,7 +114,7 @@ class PluginEventBus:
     def on(self, name: str, handler: Handler, *, event_type: type | None = None, priority: int = 0) -> None:
         entries = self._handlers.setdefault(name, [])
         entries.append(_HandlerEntry(handler=handler, event_type=event_type, priority=priority))
-        entries.sort(key=lambda entry: entry.priority)
+        entries.sort(key=lambda entry: entry.priority, reverse=True)
 
     def reset(self) -> None:
         self._handlers.clear()

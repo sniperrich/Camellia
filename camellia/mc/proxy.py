@@ -36,10 +36,12 @@ from .protocol import (
 from .yggdrasil import GameProfile, StandardYggdrasil, UserProfile, YggdrasilData
 from ..plugins.events import (
     AnimationEvent,
+    ChatMessageEvent,
     GameJoinEvent,
     InteractEvent,
     LoginSuccessEvent,
     PacketDirection,
+    PlayerPositionEvent,
     PluginMessageEvent,
     SetEntityMetadataEvent,
     SwingArmEvent,
@@ -561,6 +563,8 @@ class _ProxySession:
     def _get_plugin_message_id(self, direction: PacketDirection) -> Optional[int]:
         if self.protocol_version == int(ProtocolVersion.V108X):
             return 0x17 if direction == PacketDirection.SERVERBOUND else 0x3F
+        if self.protocol_version == int(ProtocolVersion.V1122):
+            return 0x09 if direction == PacketDirection.SERVERBOUND else 0x18
         if self.protocol_version == int(ProtocolVersion.V1200):
             return 0x0D if direction == PacketDirection.SERVERBOUND else 0x17
         if self.protocol_version == int(ProtocolVersion.V1206):
@@ -618,6 +622,72 @@ class _ProxySession:
                     await self._events.emit("interact", event)
                     if event.cancelled:
                         return None
+            elif self.protocol_version == int(ProtocolVersion.V1122):
+                play_plugin_id = self._get_plugin_message_id(PacketDirection.SERVERBOUND)
+                if play_plugin_id is not None and packet_id == play_plugin_id:
+                    return await self._handle_plugin_message(PacketDirection.SERVERBOUND, packet_id, payload, body)
+                if packet_id == 0x02:
+                    try:
+                        message, size = read_string(body, 0, 256)
+                    except ProtocolError as exc:
+                        self.logger.debug("Chat message parse failed: %s", exc)
+                        return payload
+                    event = ChatMessageEvent(session=self, message=message)
+                    await self._events.emit("chat_message", event)
+                    if event.cancelled:
+                        return None
+                    if event.message != message:
+                        try:
+                            return write_varint(packet_id) + write_string(event.message, 256)
+                        except ProtocolError as exc:
+                            self.logger.debug("Chat message build failed: %s", exc)
+                if packet_id == 0x0E:
+                    try:
+                        offset = 0
+                        x, size = self._read_double(body, offset)
+                        offset += size
+                        y, size = self._read_double(body, offset)
+                        offset += size
+                        z, size = self._read_double(body, offset)
+                        offset += size
+                        yaw, size = self._read_float(body, offset)
+                        offset += size
+                        pitch, size = self._read_float(body, offset)
+                        offset += size
+                        on_ground, _ = read_bool(body, offset)
+                    except ProtocolError as exc:
+                        self.logger.debug("Player position parse failed: %s", exc)
+                        return payload
+                    event = PlayerPositionEvent(
+                        session=self,
+                        x=x,
+                        y=y,
+                        z=z,
+                        yaw=yaw,
+                        pitch=pitch,
+                        on_ground=on_ground,
+                    )
+                    await self._events.emit("player_position", event)
+                    if event.cancelled:
+                        return None
+                    if (
+                        event.x != x
+                        or event.y != y
+                        or event.z != z
+                        or event.yaw != yaw
+                        or event.pitch != pitch
+                        or event.on_ground != on_ground
+                    ):
+                        new_body = struct.pack(
+                            ">dddff?",
+                            float(event.x),
+                            float(event.y),
+                            float(event.z),
+                            float(event.yaw),
+                            float(event.pitch),
+                            bool(event.on_ground),
+                        )
+                        return write_varint(packet_id) + new_body
             elif self._is_proto(ProtocolVersion.V1200):
                 play_plugin_id = self._get_plugin_message_id(PacketDirection.SERVERBOUND)
                 if play_plugin_id is not None and packet_id == play_plugin_id:
@@ -752,6 +822,22 @@ class _ProxySession:
                 sanitized = self._sanitize_clientbound_play_v108x(packet_id, body)
                 if sanitized is not None:
                     return write_varint(packet_id) + sanitized
+            elif self.protocol_version == int(ProtocolVersion.V1122):
+                play_plugin_id = self._get_plugin_message_id(PacketDirection.CLIENTBOUND)
+                if play_plugin_id is not None and packet_id == play_plugin_id:
+                    return await self._handle_plugin_message(PacketDirection.CLIENTBOUND, packet_id, payload, body)
+                if packet_id == 0x23:
+                    try:
+                        if len(body) < 4:
+                            raise ProtocolError("join game packet too short")
+                        player_id = int.from_bytes(body[0:4], "big", signed=True)
+                    except ProtocolError as exc:
+                        self.logger.debug("Game join parse failed: %s", exc)
+                        return payload
+                    event = GameJoinEvent(session=self, player_id=player_id, payload=body[4:])
+                    await self._events.emit("game_join", event)
+                    if event.cancelled:
+                        return None
             elif self._is_proto(ProtocolVersion.V1200):
                 play_plugin_id = self._get_plugin_message_id(PacketDirection.CLIENTBOUND)
                 if play_plugin_id is not None and packet_id == play_plugin_id:
@@ -1143,6 +1229,16 @@ class _ProxySession:
             ("crc-be-ctr1", 1, False),
             ("crc-le-ctr1", 1, True),
         ]
+        failures: list[str] = []
+        successes: list[str] = []
+
+        def _summarize(entries: list[str], limit: int = 6) -> str:
+            if not entries:
+                return "none"
+            shown = entries[:limit]
+            extra = len(entries) - limit
+            return "; ".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
+
         for strategy_name, strategy_profile in strategies:
             for host, port in servers:
                 for wire_name, counter_start, crc_le in wire_variants:
@@ -1156,23 +1252,26 @@ class _ProxySession:
                         crc_little_endian=crc_le,
                     )
                     if ok:
-                        self.logger.info(
-                            "Yggdrasil join success (%s/%s) via %s:%s",
-                            strategy_name,
-                            wire_name,
-                            host,
-                            port,
+                        successes.append(f"{host}:{port} {strategy_name}/{wire_name}")
+                        print(
+                            "Yggdrasil join success (%s/%s) via %s:%s"
+                            % (strategy_name, wire_name, host, port)
                         )
+                        if failures:
+                            print(
+                                "Yggdrasil attempts before success (%d): %s"
+                                % (len(failures), _summarize(failures))
+                            )
+                        print("Yggdrasil auth success list: %s" % _summarize(successes))
                         return
-                    self.logger.warning(
-                        "Yggdrasil join failed (%s/%s) via %s:%s: %s",
-                        strategy_name,
-                        wire_name,
-                        host,
-                        port,
-                        err,
+                    failures.append(f"{host}:{port} {strategy_name}/{wire_name}")
+                    print(
+                        "Yggdrasil join failed (%s/%s) via %s:%s: %s"
+                        % (strategy_name, wire_name, host, port, err)
                     )
-        self.logger.warning("Yggdrasil join failed across all strategies")
+        print("Yggdrasil join failed across all strategies")
+        if failures:
+            print("Yggdrasil auth failed list (%d): %s" % (len(failures), _summarize(failures)))
 
     @staticmethod
     def _build_auth_strategies(profile: GameProfile) -> list[tuple[str, GameProfile]]:

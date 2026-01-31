@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import struct
 import time
@@ -22,6 +23,9 @@ _MC_VERSION_SALT = bytes([0x01, 0x00, 0x04, 0x80, 0xD2, 0x3E, 0xF7, 0x11, 0x01])
 _TCP_SALT = bytes(
     [0x2F, 0x84, 0xAE, 0xA3, 0x99, 0x21, 0x29, 0x26, 0xDA, 0xBF, 0x95, 0xA3, 0xAB, 0xAF, 0x37, 0xE0]
 )
+
+_DEBUG_DUMP = os.getenv("NEL_YGG_DUMP") == "1"
+_DEBUG_DUMP_PATH = os.getenv("NEL_YGG_DUMP_PATH", os.path.join("logs", "yggdrasil-compare.log"))
 
 _PUBLIC_KEY = load_public_key(
     "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4HJFrYdVTeoSvH6qsnJElfXuf7FnxxFQdz3gRCs66LDr"
@@ -58,6 +62,20 @@ def _sha256(data: bytes) -> bytes:
     import hashlib
 
     return hashlib.sha256(data).digest()
+
+
+def _dump_debug(message: str) -> None:
+    if not _DEBUG_DUMP:
+        return
+    try:
+        folder = os.path.dirname(_DEBUG_DUMP_PATH)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(_DEBUG_DUMP_PATH, "a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {message}\n")
+    except OSError:
+        return
 
 
 def _xor_bytes(a: bytes, b: bytes) -> bytes:
@@ -199,7 +217,8 @@ class GameProfile:
     user: UserProfile
 
     def get_mod_info(self) -> str:
-        return json.dumps(self.mods.to_dict(), ensure_ascii=False)
+        # Match C# JsonSerializer output (no spaces) to keep Yggdrasil hash consistent.
+        return json.dumps(self.mods.to_dict(), ensure_ascii=False, separators=(",", ":"))
 
 
 class YggdrasilGenerator:
@@ -286,7 +305,7 @@ class StandardYggdrasil:
         import json as _json
         import urllib.request
 
-        with urllib.request.urlopen("https://x19.update.netease.com/authserver.list") as resp:
+        with urllib.request.urlopen("https://x19.update.netease.com/authserver.list", timeout=5) as resp:
             payload = _json.loads(resp.read().decode("utf-8"))
         if not payload:
             raise RuntimeError("no auth servers available")
@@ -336,14 +355,23 @@ class StandardYggdrasil:
             return False, f"connect: {exc}"
 
     def _initialize_connection(self, sock: socket.socket, profile: GameProfile) -> bytes:
-        received = _read_stream_with_int16(sock)
+        try:
+            received = _read_stream_with_int16(sock)
+        except Exception as e:
+            raise RuntimeError(f"read initial response failed: {e}")
         if len(received) < 272:
-            raise RuntimeError("invalid response length")
+            raise RuntimeError(f"invalid response length: {len(received)} < 272")
         login_seed = received[:16]
         sign_content = received[16:16 + 256]
         message = self.generator.generate_initialize_message(profile, login_seed, sign_content)
-        sock.sendall(message)
-        response = _read_stream_with_int16(sock)
+        try:
+            sock.sendall(message)
+        except Exception as e:
+            raise RuntimeError(f"send init message failed: {e}")
+        try:
+            response = _read_stream_with_int16(sock)
+        except Exception as e:
+            raise RuntimeError(f"read init response failed: {e}")
         if not response:
             raise RuntimeError("empty response")
         status = response[0]
@@ -362,17 +390,58 @@ class StandardYggdrasil:
         crc_little_endian: bool,
     ) -> Tuple[bool, str]:
         token = profile.user.get_auth_token()
+        auth_id = profile.user.get_auth_id()
+        if _DEBUG_DUMP:
+            _dump_debug(
+                "auth_id=%s token_hex=%s server_id=%s login_seed=%s counter_start=%s crc_le=%s"
+                % (
+                    auth_id,
+                    token.hex(),
+                    server_id,
+                    login_seed.hex(),
+                    counter_start,
+                    crc_little_endian,
+                )
+            )
         packer = ChaChaPacker(token + login_seed, _CHACHA_NONCE, rounds=8, counter_start=counter_start)
         unpacker = ChaChaPacker(login_seed + token, _CHACHA_NONCE, rounds=8, counter_start=counter_start)
+        join_payload = self.generator.generate_join_message(profile, server_id, login_seed)
+        if _DEBUG_DUMP:
+            _dump_debug(
+                "join_len=%s join_sha256=%s join_hex=%s"
+                % (
+                    len(join_payload),
+                    _sha256(join_payload).hex(),
+                    join_payload.hex(),
+                )
+            )
         message = _pack_message(
             packer,
             9,
-            self.generator.generate_join_message(profile, server_id, login_seed),
+            join_payload,
             crc_little_endian=crc_little_endian,
         )
-        sock.sendall(message)
-        response = _read_stream_with_int16(sock)
-        packet_type, payload = _unpack_message(unpacker, response, crc_little_endian=crc_little_endian)
+        if _DEBUG_DUMP:
+            _dump_debug(
+                "pack_len=%s pack_sha256=%s pack_hex=%s"
+                % (
+                    len(message),
+                    _sha256(message).hex(),
+                    message.hex(),
+                )
+            )
+        try:
+            sock.sendall(message)
+        except Exception as e:
+            return False, f"send: {e}"
+        try:
+            response = _read_stream_with_int16(sock)
+        except Exception as e:
+            return False, f"recv: {e}"
+        try:
+            packet_type, payload = _unpack_message(unpacker, response, crc_little_endian=crc_little_endian)
+        except Exception as e:
+            return False, f"unpack: {e}"
         if packet_type != 9 or not payload or payload[0] != 0x00:
             err = payload[0] if payload else 0xFF
             return False, f"{err:02X}"

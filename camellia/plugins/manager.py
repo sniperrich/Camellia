@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 import logging
+import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -274,8 +276,32 @@ _DEFAULT_MANAGER: PluginManager | None = None
 def get_plugin_manager() -> PluginManager:
     global _DEFAULT_MANAGER  # pylint: disable=global-statement
     if _DEFAULT_MANAGER is None:
-        _DEFAULT_MANAGER = PluginManager()
+        _DEFAULT_MANAGER = PluginManager(plugins_dir=_resolve_plugins_dir())
     return _DEFAULT_MANAGER
+
+
+def _resolve_plugins_dir() -> Path:
+    env = os.getenv("CAMELLIA_PLUGINS_DIR")
+    if env:
+        return Path(env)
+
+    cwd_plugins = Path.cwd() / "plugins"
+    if cwd_plugins.exists():
+        return cwd_plugins
+
+    exe_dir = Path(sys.executable).resolve().parent
+    bundled_plugins = exe_dir / "plugins"
+    user_plugins = Path.home() / ".camellia" / "plugins"
+
+    if bundled_plugins.exists():
+        if not user_plugins.exists():
+            try:
+                shutil.copytree(bundled_plugins, user_plugins)
+            except Exception:  # pylint: disable=broad-except
+                return bundled_plugins
+        return user_plugins
+
+    return user_plugins
 
 
 def _normalize_dependencies(value: Any) -> list[str]:

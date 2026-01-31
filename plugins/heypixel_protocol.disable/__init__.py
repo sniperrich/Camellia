@@ -36,6 +36,8 @@ BRAND_CHANNEL = "minecraft:brand"
 HEYPIXEL_CHANNEL = "heypixel:s2cevent"
 SYNC_SKINS_CHANNEL = "heypixel:sync_skins"
 DERIVE_KEY_URL = "https://service.codexus.today/third-party/heypixel/derive-key"
+SAFE_MINIMAL = False  # 设为 True 可仅回应反射排查踢出；默认关闭以启用完整协议
+TARGET_GAME_ID = "4661334467366178884"
 
 MSG_LA5 = 1
 MSG_FSYR = 2  # Heartbeat message
@@ -51,6 +53,9 @@ MSG_TYPE_REFLECT_CHECK = 3
 
 REGISTER_CHANNELS = [
     "worldedit:cui",
+    "bungeequeue:queue",
+    "legacy:redisbungee",
+    "gameteam:redisteam",
     "fml:loginwrapper",
     "forge:tier_sorting",
     "storemod:buy",
@@ -74,6 +79,28 @@ REGISTER_CHANNELS = [
 ]
 
 SYNC_SKINS_PAYLOAD = base64.b64decode("ASQwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMzliYzYyMTM=")
+
+# Naven/decoded 常见路径与默认伪造配置
+DEFAULT_GAME_PATH = "E:\\MCLDownload\\Game\\.minecraft"
+DEFAULT_JRE_PATH = "E:\\MCLDownload\\ext\\jre-v64-220420\\jdk17"
+DEFAULT_MOD_LIST = [
+    "minecraft",
+    "saturn",
+    "entityculling",
+    "mixinextras",
+    "netease_official",
+    "fastload",
+    "geckolib",
+    "waveycapes",
+    "ferritecore",
+    "embeddium_extra",
+    "heypixelmod",
+    "cloth_config",
+    "forge",
+    "embeddium",
+    "rubidium",
+    "oculus",
+]
 
 # 伪造的 DLL 模块列表
 FAKE_MODULE_LIST = [
@@ -125,11 +152,10 @@ def _log_heypixel_payload(direction: str, payload: bytes, state: HeypixelState |
     msg_id = None
     inner_len = None
     decoded = None
-    if data and data[0] == 0xFA:
-        decoded = _decode_event_payload(data)
-        if decoded:
-            msg_id = decoded[0]
-            inner_len = len(decoded[1])
+    decoded = _decode_event_payload(data)
+    if decoded:
+        msg_id = decoded[0]
+        inner_len = len(decoded[1])
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts} {direction} msg={msg_id if msg_id is not None else '?'} len={len(data)}"
     if inner_len is not None:
@@ -182,6 +208,10 @@ class ClickTracker:
 @dataclass
 class HeypixelState:
     registered: bool = False
+    register_recv_count: int = 0
+    register_replied: bool = False
+    register_payload_hash: str | None = None
+    last_server_channels: list[str] = field(default_factory=list)
     brand_sent: bool = False
     server_channels: set[str] = field(default_factory=set)
     heypixel_detected: bool = False
@@ -201,6 +231,7 @@ class HeypixelState:
     last_cps: tuple[int, int] | None = None
     black_class_sent: bool = False
     black_module_sent: bool = False
+    random_uuid: str | None = None
 
     def cleanup(self) -> None:
         self.game_joined = False
@@ -219,6 +250,7 @@ class HeypixelState:
         self.last_cps = None
         self.black_class_sent = False
         self.black_module_sent = False
+        self.random_uuid = None
 
 
 class HeypixelCrypto:
@@ -249,54 +281,81 @@ def setup(context) -> None:
     events = context.events
     logger = context.logger
 
+    # 创建调试日志文件
+    from pathlib import Path
+    debug_log = Path("logs/debug-heypixel.log")
+    debug_log.parent.mkdir(exist_ok=True)
+
+    def write_debug(msg: str) -> None:
+        with open(debug_log, "a") as f:
+            from datetime import datetime
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} {msg}\n")
+            f.flush()
+
+    write_debug("Heypixel plugin loaded")
+
     async def on_login_success(event: LoginSuccessEvent) -> None:
         session = event.session
+        if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
+            return
         if not _is_supported_version(session):
             return
         state = _get_state(session)
         _ensure_identity(session, state)
-        await _ensure_registered(session, logger)
-        _start_derive_key(session, state, logger)
-        _start_heartbeat_task(session, state, logger)
-        logger.info("Heypixel: Login success process initiated (v=%s)", getattr(session, "protocol_version", "unknown"))
+        # 不在这里主动发送 register/brand，等待客户端发送后拦截替换
+        if not SAFE_MINIMAL:
+            _start_derive_key(session, state, logger)
+            _start_heartbeat_task(session, state, logger)
+            logger.info("Heypixel: Login success process initiated (v=%s)", getattr(session, "protocol_version", "unknown"))
 
     async def on_game_join(event: GameJoinEvent) -> None:
         session = event.session
+        if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
+            return
         if not _is_supported_version(session):
             return
         state = _get_state(session)
         state.game_joined = True
-        if state.click_tracker is None:
-            state.click_tracker = ClickTracker()
-        await _send_sync_skins(session, logger)
-        await _send_info(session, state, logger)
-        _start_cps_task(session, state, logger)
-        _start_heartbeat_task(session, state, logger)
-        logger.info("Heypixel: Game join process completed")
+        if not SAFE_MINIMAL:
+            if state.click_tracker is None:
+                state.click_tracker = ClickTracker()
+            await _send_sync_skins(session, logger)
+            await _send_info(session, state, logger)
+            _start_cps_task(session, state, logger)
+            _start_heartbeat_task(session, state, logger)
+            logger.info("Heypixel: Game join process completed")
 
     async def on_swing_arm(event: SwingArmEvent) -> None:
         session = event.session
+        if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
+            return
         if not _is_supported_version(session):
             return
         state = _get_state(session)
-        if state.click_tracker:
+        if not SAFE_MINIMAL and state.click_tracker:
             await state.click_tracker.record_left()
 
     async def on_use_item(event: UseItemEvent) -> None:
         session = event.session
+        if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
+            return
         if not _is_supported_version(session):
             return
         state = _get_state(session)
-        if state.click_tracker:
+        if not SAFE_MINIMAL and state.click_tracker:
             await state.click_tracker.record_right()
 
     async def on_use_item_on(event: UseItemOnEvent) -> None:
         session = event.session
+        if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
+            return
         if not _is_supported_version(session):
             return
         if event.cancelled:
             return
         state = _get_state(session)
+        if SAFE_MINIMAL:
+            return
         if not state.game_joined or not state.heypixel_detected:
             return
         await _send_block_message(session, state, event, logger)
@@ -305,11 +364,17 @@ def setup(context) -> None:
         session = event.session
         if not _is_supported_version(session):
             return
+        state_name = getattr(getattr(session, "state", None), "name", None)
+        if state_name not in ("PLAY", "CONFIGURATION"):
+            return
         state = _get_state(session)
+        msg = f"Received plugin_message: dir={event.direction} id={event.identifier}"
+        logger.info(f"Heypixel: {msg}")
+        write_debug(msg)
         if event.direction == PacketDirection.SERVERBOUND:
             _handle_serverbound(event, state, logger)
         elif event.direction == PacketDirection.CLIENTBOUND:
-            await _handle_clientbound(event, state, logger)
+            await _handle_clientbound(event, state, logger, write_debug)
         else:
             raise ValueError("Invalid packet direction")
 
@@ -320,31 +385,79 @@ def setup(context) -> None:
         # 暂时只记录日志
         pass
 
-    events.on("plugin_message", on_plugin_message, event_type=PluginMessageEvent)
-    events.on("game_join", on_game_join, event_type=GameJoinEvent)
-    events.on("swing_arm", on_swing_arm, event_type=SwingArmEvent)
-    events.on("use_item", on_use_item, event_type=UseItemEvent)
-    events.on("use_item_on", on_use_item_on, event_type=UseItemOnEvent)
+    # 关键：和 Fantnel 一样，在 base_1200 通道注册 PluginMessage 处理器
+    # PLAY + CONFIGURATION 都要处理（CONFIGURATION 阶段有 register/brand）
+    events.on("base_1200", on_plugin_message, event_type=PluginMessageEvent)
+    events.on("base_1200", on_game_join, event_type=GameJoinEvent)
+    events.on("base_1200", on_swing_arm, event_type=SwingArmEvent)
+    events.on("base_1200", on_use_item, event_type=UseItemEvent)
+    events.on("base_1200", on_use_item_on, event_type=UseItemOnEvent)
+    events.on("base_1200", on_set_entity_metadata, event_type=SetEntityMetadataEvent)
     events.on("channel_v1206", on_login_success, event_type=LoginSuccessEvent)
-    events.on("set_entity_metadata", on_set_entity_metadata, event_type=SetEntityMetadataEvent)
 
 
 def _handle_serverbound(event: PluginMessageEvent, state: HeypixelState, logger) -> None:
     if event.identifier == BRAND_CHANNEL:
+        # 替换 brand 为 "forge"
         event.payload = _build_brand_payload()
         state.brand_sent = True
-    elif event.identifier == REGISTER_CHANNEL:
-        event.payload = _build_register_payload()
-        state.registered = True
+        logger.debug("Heypixel: 已替换 brand 为 forge")
+        return
 
-
-async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, logger) -> None:
     if event.identifier == REGISTER_CHANNEL:
+        merged = _merge_register_channels(state.last_server_channels)
+        if merged:
+            payload = _build_register_payload_from_list(merged)
+            state.register_payload_hash = hashlib.sha256(payload).hexdigest()
+            event.payload = payload
+            state.register_replied = True
+            logger.debug("Heypixel: 已替换 client register 为合并列表")
+
+
+async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, logger, write_debug=None) -> None:
+    if event.identifier == REGISTER_CHANNEL:
+        msg = f"Processing REGISTER message (count={state.register_recv_count + 1})"
+        logger.info(f"Heypixel: {msg}")
+        if write_debug:
+            write_debug(msg)
         channels = _parse_channels(event.payload)
+        msg = f"Parsed channels: {channels}"
+        logger.info(f"Heypixel: {msg}")
+        if write_debug:
+            write_debug(msg)
         if channels:
+            state.last_server_channels = channels
             state.server_channels.update(channels)
             if any(ch.startswith("heypixel:") for ch in channels):
                 state.heypixel_detected = True
+                msg = "Detected heypixel channels"
+                logger.info(f"Heypixel: {msg}")
+                if write_debug:
+                    write_debug(msg)
+        state.register_recv_count += 1
+        merged_source = channels or state.last_server_channels
+        merged = _merge_register_channels(merged_source)
+        if merged:
+            payload = _build_register_payload_from_list(merged)
+            payload_hash = hashlib.sha256(payload).hexdigest()
+            if payload_hash != state.register_payload_hash:
+                msg = "Sending merged register reply"
+                logger.info(f"Heypixel: {msg}")
+                if write_debug:
+                    write_debug(msg)
+                try:
+                    await event.session.send_plugin_message(PacketDirection.SERVERBOUND, REGISTER_CHANNEL, payload)
+                    state.register_payload_hash = payload_hash
+                    state.register_replied = True
+                    msg = "已回复合并后的通道列表"
+                    logger.info(f"Heypixel: {msg}")
+                    if write_debug:
+                        write_debug(msg)
+                except ProtocolError as exc:
+                    msg = f"回复 register 失败: {exc}"
+                    logger.info(f"Heypixel: {msg}")
+                    if write_debug:
+                        write_debug(msg)
         return
 
     if event.identifier != HEYPIXEL_CHANNEL:
@@ -393,6 +506,8 @@ def _start_derive_key(session, state: HeypixelState, logger) -> None:
     if state.derived_key or state.derive_task:
         return
     if not state.profile_uuid:
+        return
+    if SAFE_MINIMAL:
         return
 
     async def task() -> None:
@@ -453,6 +568,8 @@ async def _maybe_send_black_checks(session, state: HeypixelState, logger) -> Non
 def _start_heartbeat_task(session, state: HeypixelState, logger) -> None:
     if state.heartbeat_task:
         return
+    if SAFE_MINIMAL:
+        return
 
     async def heartbeat_loop() -> None:
         while session.is_active:
@@ -471,6 +588,8 @@ def _start_heartbeat_task(session, state: HeypixelState, logger) -> None:
 
 def _start_cps_task(session, state: HeypixelState, logger) -> None:
     if state.cps_task:
+        return
+    if SAFE_MINIMAL:
         return
 
     async def cps_loop() -> None:
@@ -501,7 +620,7 @@ async def _send_cps(session, state: HeypixelState, logger) -> None:
     elif state.last_cps == (left_cps, right_cps):
         return
     payload = _build_cps_payload(left_cps, right_cps)
-    payload = _encode_event_payload(MSG_OWX2, payload)
+    payload = _encode_event_payload(MSG_OWX2, payload, state=state, encrypt=False)
     try:
         _log_heypixel_payload("send", payload, state, note=f"cps={left_cps}/{right_cps}", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
@@ -512,13 +631,14 @@ async def _send_cps(session, state: HeypixelState, logger) -> None:
 
 async def _send_heartbeat(session, state: HeypixelState, logger) -> None:
     payload = _build_heartbeat_payload()
-    payload = _encode_event_payload(MSG_FSYR, payload)
+    payload = _encode_event_payload(MSG_FSYR, payload, state=state, encrypt=False)
     try:
         _log_heypixel_payload("send", payload, state, note="heartbeat", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         logger.debug("Heypixel: 已发送心跳包")
     except ProtocolError as exc:
         logger.debug("Heypixel: 心跳包发送失败: %s", exc)
+
 
 
 async def _send_sync_skins(session, logger) -> None:
@@ -538,6 +658,8 @@ async def _send_info(session, state: HeypixelState, logger) -> None:
         return
     if state.enc_profile is None or state.enc_zero is None:
         _refresh_encrypted_strings(state)
+    if SAFE_MINIMAL:
+        return
 
     now_ms = int(time.time() * 1000)
     payload = _build_la5_payload(
@@ -547,9 +669,9 @@ async def _send_info(session, state: HeypixelState, logger) -> None:
         timestamp=now_ms,
         extra="",
         state=state,
+        session=session,
     )
-    payload = _encrypt_payload(state, payload)
-    payload = _encode_event_payload(MSG_LA5, payload)
+    payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
         _log_heypixel_payload("send", payload, state, note="info", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
@@ -575,9 +697,9 @@ async def _send_reflect_response(session, state: HeypixelState, request: dict[st
         timestamp=int(request.get("timestamp") or now_ms),
         extra=str(request.get("extra") or ""),
         state=state,
+        session=session,
     )
-    payload = _encrypt_payload(state, payload)
-    payload = _encode_event_payload(MSG_LA5, payload)
+    payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
         _log_heypixel_payload("send", payload, state, note="reflect", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
@@ -597,9 +719,9 @@ async def _send_black_class_response(session, state: HeypixelState, request: dic
         timestamp=int(time.time() * 1000),
         extra="",
         state=state,
+        session=session,
     )
-    payload = _encrypt_payload(state, payload)
-    payload = _encode_event_payload(MSG_LA5, payload)
+    payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
         _log_heypixel_payload("send", payload, state, note="black_class", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
@@ -619,9 +741,9 @@ async def _send_black_module_response(session, state: HeypixelState, request: di
         timestamp=int(time.time() * 1000),
         extra="",
         state=state,
+        session=session,
     )
-    payload = _encrypt_payload(state, payload)
-    payload = _encode_event_payload(MSG_LA5, payload)
+    payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
         _log_heypixel_payload("send", payload, state, note="black_module", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
@@ -670,7 +792,7 @@ async def _send_block_message(session, state: HeypixelState, event: UseItemOnEve
         head_pitch=float(head_pitch),
         is_hand=False,
     )
-    payload = _encode_event_payload(MSG_CMESSAGE_BLOCK, payload)
+    payload = _encode_event_payload(MSG_CMESSAGE_BLOCK, payload, state=state, encrypt=False)
     try:
         _log_heypixel_payload("send", payload, state, note="block", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
@@ -780,14 +902,11 @@ def _decrypt_payload(state: HeypixelState, payload: bytes) -> bytes:
 
 
 def _build_register_payload() -> bytes:
-    unique = []
-    seen = set()
-    for channel in REGISTER_CHANNELS:
-        if channel in seen:
-            continue
-        seen.add(channel)
-        unique.append(channel)
-    return "\x00".join(unique).encode("utf-8")
+    return _build_register_payload_from_list(REGISTER_CHANNELS)
+
+
+def _build_register_payload_from_list(channels: list[str]) -> bytes:
+    return "\x00".join(channels).encode("utf-8")
 
 
 def _build_brand_payload() -> bytes:
@@ -808,26 +927,59 @@ def _parse_channels(payload: bytes) -> list[str]:
     return [item for item in raw.split("\x00") if item]
 
 
-def _encode_event_payload(msg_id: int, payload: bytes) -> bytes:
-    return b"\xFA" + write_varint(msg_id) + write_varint(len(payload)) + payload
+def _merge_register_channels(server_channels: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen = set()
+    for channel in list(server_channels) + REGISTER_CHANNELS:
+        if not channel or channel in seen:
+            continue
+        seen.add(channel)
+        merged.append(channel)
+    return merged
+
+
+def _encode_event_payload(msg_id: int, payload: bytes, *, state: HeypixelState | None, encrypt: bool) -> bytes:
+    """Encode with VarInt msg_id + VarInt(len); body含msgpack时间戳，可选DES."""
+    timestamp = _pack_long(int(time.time() * 1000))
+    body = timestamp + payload
+    if encrypt and state is not None:
+        body = _encrypt_payload(state, body)
+    # Fantnel/Naven: length = payload_len + 1
+    header = write_varint(msg_id) + write_varint(len(body) + 1)
+    return header + body
 
 
 def _decode_event_payload(payload: bytes) -> tuple[int, bytes] | None:
     if not payload:
         return None
     data = payload.tobytes() if isinstance(payload, memoryview) else payload
-    if not data or data[0] != 0xFA:
-        return None
+    # primary: 0xFA + int32 msg_id + VarInt(len) (server->client)
     try:
-        offset = 1
+        offset = 0
+        if data[offset] == 0xFA:
+            offset += 1
+            if offset + 4 > len(data):
+                return None
+            msg_id = struct.unpack(">i", data[offset : offset + 4])[0]
+            offset += 4
+            declared_len, size = read_varint(data, offset)
+            offset += size
+            if declared_len < 0 or offset + declared_len > len(data):
+                return None
+            return msg_id, data[offset : offset + declared_len]
+    except Exception:
+        return None
+    # fallback: VarInt msg_id + VarInt(len) (client->server echoes or variants)
+    try:
+        offset = 0
         msg_id, size = read_varint(data, offset)
         offset += size
-        length, size = read_varint(data, offset)
+        declared_len, size = read_varint(data, offset)
         offset += size
-        if length < 0 or offset + length > len(data):
+        if declared_len < 0 or offset + declared_len > len(data):
             return None
-        return msg_id, data[offset : offset + length]
-    except (ProtocolError, ValueError):
+        return msg_id, data[offset : offset + declared_len]
+    except Exception:
         return None
 
 
@@ -839,26 +991,28 @@ def _build_la5_payload(
     timestamp: int,
     extra: str,
     state: HeypixelState,
+    session=None,
 ) -> bytes:
     parts = [
-        write_string(profile_uuid),
+        _mp_string(profile_uuid),
         _pack_byte(msg_type),
-        write_string(text),
+        _mp_string(text),
         _pack_long(timestamp),
     ]
     if msg_type == MSG_TYPE_INFO:
-        parts.append(_build_info_payload(state))
+        parts.append(_build_info_payload(session, state))
     elif msg_type == MSG_TYPE_BLACK_CLASS:
         parts.append(_build_black_class_payload(state))
     elif msg_type == MSG_TYPE_BLACK_MODULE:
         parts.append(_build_black_module_payload(state))
     elif msg_type == MSG_TYPE_REFLECT_CHECK and extra:
-        parts.append(write_string(extra))
+        parts.append(_mp_string(extra))
     return b"".join(parts)
 
 
 def _build_cps_payload(left_cps: int, right_cps: int) -> bytes:
-    return _pack_int(left_cps) + _pack_int(right_cps)
+    # decoded: 只发送左键 CPS，右键固定为 0
+    return _pack_int(left_cps) + _pack_int(0)
 
 
 def _build_heartbeat_payload() -> bytes:
@@ -866,31 +1020,47 @@ def _build_heartbeat_payload() -> bytes:
     return _pack_long(now_ms)
 
 
-def _build_info_payload(state: HeypixelState) -> bytes:
+def _build_info_payload(session, state: HeypixelState) -> bytes:
+    if session is None:
+        return _build_info_payload_min(state)
+    return _build_info_payload_full(session, state)
+
+
+def _build_info_payload_min(state: HeypixelState) -> bytes:
+    """最小 fallback（避免 session 不可用时崩溃）。"""
     marker = state.enc_zero or "0"
     parts = [
         _pack_int(state.random_id),
         _pack_int(1),
-        write_varint(1),
-        write_string(marker),
+        _pack_int(1),
+        _mp_string(marker),
     ]
     return b"".join(parts)
 
 
 def _build_black_class_payload(state: HeypixelState) -> bytes:
-    enc_profile = state.enc_profile or (state.profile_uuid or "")
-    enc_zero = state.enc_zero or "0"
-    marker = f"{enc_profile}:{enc_zero}"
+    # decoded ImkX: random_id, 1, 1, enc_zero
+    marker = state.enc_zero or "0"
     parts = [
-        _pack_int(len(FAKE_MODULE_LIST)),
-        write_varint(1),
-        write_string(marker),
+        _pack_int(state.random_id),
+        _pack_int(1),
+        _pack_int(1),
+        _mp_string(marker),
     ]
     return b"".join(parts)
 
 
 def _build_black_module_payload(state: HeypixelState) -> bytes:
-    parts = [write_string("") for _ in range(7)]
+    # decoded yTyX: module_count, 1, 1, enc_profile:enc_zero
+    enc_profile = state.enc_profile or (state.profile_uuid or "")
+    enc_zero = state.enc_zero or "0"
+    marker = f"{enc_profile}:{enc_zero}"
+    parts = [
+        _pack_int(len(FAKE_MODULE_LIST)),
+        _pack_int(1),
+        _pack_int(1),
+        _mp_string(marker),
+    ]
     return b"".join(parts)
 
 
@@ -934,47 +1104,299 @@ def _build_block_message_payload(
 
 def _parse_reflect_request(payload: bytes) -> dict[str, object]:
     offset = 0
-    text, size = read_string(payload, offset, 32767)
-    offset += size
-    timestamp, size = _read_long(payload, offset)
-    offset += size
-    msg_type, size = _read_byte(payload, offset)
-    offset += size
-    extra = ""
-    if offset < len(payload):
-        extra, size = read_string(payload, offset, 32767)
-        offset += size
-    return {"text": text, "timestamp": timestamp, "type": msg_type, "extra": extra}
+    # decoded: string -> long -> int -> (optional string)
+    try:
+        text, offset = _mp_read_string(payload, offset)
+        timestamp, offset = _mp_read_int(payload, offset)
+        msg_type, offset = _mp_read_int(payload, offset)
+        extra = ""
+        if offset < len(payload):
+            extra, offset = _mp_read_string(payload, offset)
+        return {"text": text, "timestamp": timestamp, "type": msg_type, "extra": extra}
+    except Exception:
+        # fallback: legacy/prepend timestamp
+        offset = 0
+        _, offset = _mp_read_int(payload, offset)
+        text, offset = _mp_read_string(payload, offset)
+        timestamp, offset = _mp_read_int(payload, offset)
+        msg_type, offset = _mp_read_int(payload, offset)
+        extra = ""
+        if offset < len(payload):
+            extra, offset = _mp_read_string(payload, offset)
+        return {"text": text, "timestamp": timestamp, "type": msg_type, "extra": extra}
 
 
-def _read_long(data: bytes, offset: int) -> tuple[int, int]:
-    end = offset + 8
-    if end > len(data):
-        raise ValueError("long out of range")
-    return struct.unpack(">q", data[offset:end])[0], 8
+def _build_info_payload_full(session, state: HeypixelState) -> bytes:
+    rng = _get_stable_rng(session, state)
+    profile_uuid = state.profile_uuid or _get_profile_uuid(session) or str(uuid.uuid4())
+    if state.random_uuid is None:
+        state.random_uuid = str(uuid.UUID(int=rng.getrandbits(128)))
 
+    mod_list = _get_mod_names(session)
+    mods = _mp_array([_mp_string(name) for name in mod_list])
 
-def _read_byte(data: bytes, offset: int) -> tuple[int, int]:
-    if offset >= len(data):
-        raise ValueError("byte out of range")
-    return data[offset], 1
+    game_path = DEFAULT_GAME_PATH
+    jre_path = DEFAULT_JRE_PATH
+
+    cpu_info = _mp_array(
+        [
+            _mp_string(_fake_cpuid(rng)),
+            _mp_string(_fake_cpu_name(rng)),
+            _mp_string(_fake_cpuidf(rng)),
+        ]
+    )
+    baseboard_info = _mp_array(
+        [
+            _mp_string(_fake_baseboard_vendor(rng)),
+            _mp_string(_fake_baseboard_model(rng)),
+            _mp_string(_fake_baseboard_serial(rng)),
+            _mp_string("1.0"),
+            _mp_string(str(uuid.UUID(int=rng.getrandbits(128))).upper()),
+        ]
+    )
+    network_info = _mp_array([_build_network_entry(rng)])
+    disk_info = _mp_array([_build_disk_entry(rng)])
+    netease_emails = _mp_array([])
+
+    # game_session / extra info placeholder
+    game_session = _mp_array(
+        [
+            _mp_string(state.random_uuid),
+            _mp_string(profile_uuid),
+            _pack_long(int(time.time() * 1000)),
+            _pack_long(0),
+        ]
+    )
+
+    parts = [
+        mods,
+        _mp_string(game_path),
+        _mp_string(jre_path),
+        cpu_info,
+        baseboard_info,
+        network_info,
+        disk_info,
+        netease_emails,
+        game_session,
+    ]
+    return b"".join(parts)
 
 
 def _pack_float(value: float) -> bytes:
-    return struct.pack(">f", float(value))
+    return b"\xCA" + struct.pack(">f", float(value))
 
 
 def _pack_long(value: int) -> bytes:
-    return struct.pack(">q", int(value))
+    v = int(value)
+    if -32 <= v <= 127:
+        return bytes([v & 0xFF])
+    if -128 <= v <= 127:
+        return b"\xD0" + struct.pack(">b", v)
+    if -32768 <= v <= 32767:
+        return b"\xD1" + struct.pack(">h", v)
+    if -2147483648 <= v <= 2147483647:
+        return b"\xD2" + struct.pack(">i", v)
+    if 0 <= v <= 0xFFFFFFFF:
+        return b"\xCE" + struct.pack(">I", v)
+    return b"\xD3" + struct.pack(">q", v)
 
 
 def _pack_byte(value: int) -> bytes:
-    return bytes([int(value) & 0xFF])
+    return _pack_int(value)
 
 
 def _pack_int(value: int) -> bytes:
-    return struct.pack(">i", int(value))
+    v = int(value)
+    if -32 <= v <= 127:
+        return bytes([v & 0xFF])
+    if -128 <= v <= 127:
+        return b"\xD0" + struct.pack(">b", v)
+    if -32768 <= v <= 32767:
+        return b"\xD1" + struct.pack(">h", v)
+    if 0 <= v <= 255:
+        return b"\xCC" + struct.pack(">B", v)
+    if 256 <= v <= 65535:
+        return b"\xCD" + struct.pack(">H", v)
+    if -2147483648 <= v <= 2147483647:
+        return b"\xD2" + struct.pack(">i", v)
+    if 0 <= v <= 0xFFFFFFFF:
+        return b"\xCE" + struct.pack(">I", v)
+    return b"\xD3" + struct.pack(">q", v)
 
 
 def _pack_bool(value: bool) -> bytes:
-    return b"\x01" if value else b"\x00"
+    return b"\xC3" if value else b"\xC2"
+
+
+def _mp_string(value: str) -> bytes:
+    data = value.encode("utf-8")
+    length = len(data)
+    if length <= 31:
+        return bytes([0xA0 | length]) + data
+    if length <= 0xFF:
+        return b"\xD9" + bytes([length]) + data
+    if length <= 0xFFFF:
+        return b"\xDA" + struct.pack(">H", length) + data
+    return b"\xDB" + struct.pack(">I", length) + data
+
+
+def _mp_read_int(data: bytes, offset: int) -> tuple[int, int]:
+    if offset >= len(data):
+        raise ValueError("int out of range")
+    b = data[offset]
+    offset += 1
+    # positive fixint
+    if b <= 0x7F:
+        return b, offset
+    # negative fixint
+    if b >= 0xE0:
+        return b - 0x100, offset
+    if b == 0xD0:
+        if offset >= len(data):
+            raise ValueError("int8 out of range")
+        return struct.unpack(">b", data[offset:offset + 1])[0], offset + 1
+    if b == 0xD1:
+        end = offset + 2
+        if end > len(data):
+            raise ValueError("int16 out of range")
+        return struct.unpack(">h", data[offset:end])[0], end
+    if b == 0xD2:
+        end = offset + 4
+        if end > len(data):
+            raise ValueError("int32 out of range")
+        return struct.unpack(">i", data[offset:end])[0], end
+    if b == 0xD3:
+        end = offset + 8
+        if end > len(data):
+            raise ValueError("int64 out of range")
+        return struct.unpack(">q", data[offset:end])[0], end
+    if b == 0xCC:
+        if offset >= len(data):
+            raise ValueError("uint8 out of range")
+        return data[offset], offset + 1
+    if b == 0xCD:
+        end = offset + 2
+        if end > len(data):
+            raise ValueError("uint16 out of range")
+        return struct.unpack(">H", data[offset:end])[0], end
+    if b == 0xCE:
+        end = offset + 4
+        if end > len(data):
+            raise ValueError("uint32 out of range")
+        return struct.unpack(">I", data[offset:end])[0], end
+    if b == 0xCF:
+        end = offset + 8
+        if end > len(data):
+            raise ValueError("uint64 out of range")
+        return struct.unpack(">Q", data[offset:end])[0], end
+    raise ValueError(f"unsupported int prefix: {hex(b)}")
+
+
+def _mp_read_string(data: bytes, offset: int) -> tuple[str, int]:
+    if offset >= len(data):
+        raise ValueError("string out of range")
+    b = data[offset]
+    offset += 1
+    if 0xA0 <= b <= 0xBF:
+        length = b & 0x1F
+    elif b == 0xD9:
+        if offset >= len(data):
+            raise ValueError("str8 length missing")
+        length = data[offset]
+        offset += 1
+    elif b == 0xDA:
+        end = offset + 2
+        if end > len(data):
+            raise ValueError("str16 length missing")
+        length = struct.unpack(">H", data[offset:end])[0]
+        offset = end
+    elif b == 0xDB:
+        end = offset + 4
+        if end > len(data):
+            raise ValueError("str32 length missing")
+        length = struct.unpack(">I", data[offset:end])[0]
+        offset = end
+    else:
+        raise ValueError(f"unsupported string prefix: {hex(b)}")
+    end = offset + length
+    if end > len(data):
+        raise ValueError("string body out of range")
+    return data[offset:end].decode("utf-8", errors="replace"), end
+
+
+def _mp_array(items: list[bytes]) -> bytes:
+    length = len(items)
+    if length <= 0x0F:
+        prefix = bytes([0x90 | length])
+    elif length <= 0xFFFF:
+        prefix = b"\xDC" + struct.pack(">H", length)
+    else:
+        prefix = b"\xDD" + struct.pack(">I", length)
+    return prefix + b"".join(items)
+
+
+def _get_stable_rng(session, state: HeypixelState) -> random.Random:
+    seed = state.profile_uuid or _get_name(session) or "player"
+    return random.Random(hash(seed) & 0xFFFFFFFF)
+
+
+def _get_mod_names(session) -> list[str]:
+    cfg = getattr(session, "config", None)
+    profile = getattr(cfg, "ygg_profile", None) if cfg else None
+    mods: list[str] = []
+    if profile and getattr(profile, "mods", None):
+        for mod in profile.mods.mods:
+            name = getattr(mod, "id", "") or getattr(mod, "name", "")
+            if name and name not in mods:
+                mods.append(name)
+    return mods or list(DEFAULT_MOD_LIST)
+
+
+def _fake_cpuid(rng: random.Random) -> str:
+    return "".join(rng.choice("0123456789ABCDEF") for _ in range(16))
+
+
+def _fake_cpu_name(rng: random.Random) -> str:
+    candidates = [
+        "Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz",
+        "Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz",
+        "AMD Ryzen 5 5600X 6-Core Processor",
+    ]
+    return rng.choice(candidates)
+
+
+def _fake_cpuidf(rng: random.Random) -> str:
+    return rng.choice(["GenuineIntel", "AuthenticAMD"])
+
+
+def _fake_baseboard_vendor(rng: random.Random) -> str:
+    return rng.choice(["ASUSTeK COMPUTER INC.", "Gigabyte Technology Co., Ltd.", "MSI"])
+
+
+def _fake_baseboard_model(rng: random.Random) -> str:
+    return rng.choice(["PRIME Z390-A", "B550M DS3H", "MAG B460M MORTAR"])
+
+
+def _fake_baseboard_serial(rng: random.Random) -> str:
+    return "".join(rng.choice("0123456789ABCDEF") for _ in range(12))
+
+
+def _build_network_entry(rng: random.Random) -> bytes:
+    mac = ":".join(f"{rng.randint(0,255):02x}" for _ in range(6))
+    ip = f"192.168.{rng.randint(0,255)}.{rng.randint(2,254)}"
+    return _mp_array(
+        [
+            _mp_string("wlan0"),
+            _mp_string(mac),
+            _mp_string("Intel"),
+            _mp_array([]),
+            _mp_string(f"[{ip}]"),
+        ]
+    )
+
+
+def _build_disk_entry(rng: random.Random) -> bytes:
+    serial = "".join(rng.choice("0123456789ABCDEF") for _ in range(16))
+    name = rng.choice(["NVMe SSD", "Samsung SSD", "KINGSTON SSD"])
+    model = rng.choice(["Samsung SSD 970 EVO", "KINGSTON SA400", "WD Blue SN550"])
+    return _mp_array([_mp_string(serial), _mp_string(name), _mp_string(model)])

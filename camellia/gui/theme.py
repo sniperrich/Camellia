@@ -1,27 +1,85 @@
-"""Theme helpers for the Qt GUI."""
+"""Theme helpers for the Qt GUI with Material 3 support."""
 
-PALETTE = {
-    "bg": "#efe7dc",
-    "bg_alt": "#dbe6e1",
+# Material 3 Light Theme Palette
+LIGHT_PALETTE = {
+    "bg": "#eef1f0",
+    "bg_alt": "#dde6e2",
     "panel": "#ffffff",
-    "panel_alt": "#f3f7f5",
-    "accent": "#1f7a6b",
-    "accent_dark": "#145c50",
-    "text": "#1c2b29",
-    "muted": "#5b6b67",
-    "border": "#d6ddd8",
-    "danger": "#b5473d",
-    "warning": "#d39c2f",
+    "panel_alt": "#f4f7f6",
+    "accent": "#6750A4",  # Material 3 primary purple
+    "accent_dark": "#4F378B",
+    "accent_light": "#EADDFF",
+    "text": "#1C1B1F",
+    "text_secondary": "#49454F",
+    "muted": "#5e6f6b",
+    "border": "#d7e0dd",
+    "danger": "#BA1A1A",
+    "warning": "#7D5700",
+    "success": "#2E7D32",
+    "surface": "#FEF7FF",
+    "surface_variant": "#E7E0EC",
 }
 
+# Material 3 Dark Theme Palette
+DARK_PALETTE = {
+    "bg": "#1C1B1F",
+    "bg_alt": "#2B2930",
+    "panel": "#2B2930",
+    "panel_alt": "#36343B",
+    "accent": "#D0BCFF",  # Material 3 primary purple (dark)
+    "accent_dark": "#B69DF8",
+    "accent_light": "#4F378B",
+    "text": "#E6E1E5",
+    "text_secondary": "#CAC4D0",
+    "muted": "#938F99",
+    "border": "#49454F",
+    "danger": "#FFB4AB",
+    "warning": "#FFB951",
+    "success": "#81C784",
+    "surface": "#1C1B1F",
+    "surface_variant": "#49454F",
+}
 
-def build_stylesheet() -> str:
-    colors = PALETTE
+# Default palette (for backward compatibility)
+PALETTE = LIGHT_PALETTE
+
+
+def get_palette(theme: str = "light") -> dict:
+    """
+    Get color palette for the specified theme.
+
+    Args:
+        theme: Theme name ('light', 'dark', or 'system')
+
+    Returns:
+        Dictionary of color values
+    """
+    if theme == "dark":
+        return DARK_PALETTE
+    elif theme == "system":
+        # TODO: Detect system theme preference
+        # For now, default to light
+        return LIGHT_PALETTE
+    else:
+        return LIGHT_PALETTE
+
+
+def build_stylesheet(theme: str = "light") -> str:
+    """
+    Build Material 3 stylesheet for the specified theme.
+
+    Args:
+        theme: Theme name ('light', 'dark', or 'system')
+
+    Returns:
+        Complete stylesheet string
+    """
+    colors = get_palette(theme)
     return f"""
     * {{
         color: {colors["text"]};
-        font-family: "Source Sans 3", "Noto Sans", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-        font-size: 13px;
+        font-family: "Manrope", "Noto Sans", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+        font-size: 14px;
     }}
 
     QMainWindow, QWidget {{
@@ -29,51 +87,76 @@ def build_stylesheet() -> str:
     }}
 
     #Sidebar {{
-        background: rgba(255, 255, 255, 0.88);
+        background: rgba(255, 255, 255, 0.92);
         border-right: 1px solid {colors["border"]};
-        border-top-left-radius: 16px;
-        border-bottom-left-radius: 16px;
     }}
 
     #ContentStack {{
-        background: rgba(255, 255, 255, 0.78);
-        border: 1px solid {colors["border"]};
+        background: rgba(255, 255, 255, 0.85);
         border-left: none;
-        border-top-right-radius: 16px;
-        border-bottom-right-radius: 16px;
     }}
 
     #AppTitle {{
-        font-size: 18px;
+        font-size: 17px;
         font-weight: 700;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.2px;
     }}
 
     #Title {{
         font-size: 22px;
         font-weight: 700;
+        letter-spacing: -0.3px;
     }}
 
     #Subtitle {{
-        color: {colors["muted"]};
+        color: {colors["text_secondary"]};
+        font-size: 13px;
     }}
 
     QLineEdit {{
-        background: {colors["panel"]};
-        border: 1px solid {colors["border"]};
-        border-radius: 8px;
-        padding: 8px 10px;
+        background: {colors["surface_variant"]};
+        border: none;
+        border-bottom: 2px solid {colors["border"]};
+        border-radius: 4px 4px 0 0;
+        padding: 6px 10px;
+        font-size: 14px;
+        min-height: 30px;
     }}
 
     QLineEdit:focus {{
-        border: 1px solid {colors["accent"]};
+        border-bottom: 2px solid {colors["accent"]};
+        background: {colors["surface_variant"]};
+    }}
+    
+    QLineEdit:hover {{
+        background: {colors["panel_alt"]};
     }}
 
     QComboBox {{
         background: {colors["panel"]};
         border: 1px solid {colors["border"]};
-        border-radius: 8px;
-        padding: 6px 8px;
+        border-radius: 10px;
+        padding: 6px 10px;
+        min-width: 110px;
+    }}
+    
+    QComboBox:hover {{
+        border: 1px solid {colors["accent"]};
+    }}
+    
+    QComboBox::drop-down {{
+        border: none;
+        width: 20px;
+    }}
+    
+    QComboBox::down-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 6px solid {colors["text"]};
+        width: 0;
+        height: 0;
+        margin-right: 8px;
     }}
 
     QAbstractItemView {{
@@ -92,12 +175,12 @@ def build_stylesheet() -> str:
     QListWidget {{
         background: {colors["panel"]};
         border: 1px solid {colors["border"]};
-        border-radius: 10px;
-        padding: 6px;
+        border-radius: 12px;
+        padding: 4px;
     }}
 
     QListWidget::item {{
-        padding: 6px 8px;
+        padding: 4px 6px;
         border-radius: 6px;
     }}
 
@@ -138,28 +221,58 @@ def build_stylesheet() -> str:
     QPushButton {{
         background: {colors["panel"]};
         border: 1px solid {colors["border"]};
-        border-radius: 10px;
-        padding: 8px 14px;
+        border-radius: 12px;
+        padding: 5px 10px;
+        font-weight: 500;
+        font-size: 14px;
+        min-height: 28px;
     }}
 
     QPushButton:hover {{
         border: 1px solid {colors["accent"]};
+        background: {colors["panel_alt"]};
+    }}
+    
+    QPushButton:pressed {{
+        background: {colors["border"]};
     }}
 
     QPushButton[variant="primary"] {{
         background: {colors["accent"]};
         color: white;
         border: none;
+        border-radius: 12px;
+        padding: 6px 12px;
         font-weight: 600;
+        font-size: 14px;
+        min-height: 30px;
     }}
 
     QPushButton[variant="primary"]:hover {{
         background: {colors["accent_dark"]};
     }}
+    
+    QPushButton[variant="primary"]:pressed {{
+        background: {colors["accent_light"]};
+    }}
 
     QPushButton[variant="ghost"] {{
         background: transparent;
         border: 1px solid {colors["border"]};
+        border-radius: 12px;
+        padding: 5px 10px;
+        font-weight: 500;
+        font-size: 14px;
+        min-height: 28px;
+    }}
+    
+    QPushButton[variant="ghost"]:hover {{
+        background: {colors["panel_alt"]};
+        border: 1px solid {colors["accent"]};
+    }}
+    
+    QPushButton[variant="ghost"]:pressed {{
+        background: {colors["border"]};
     }}
 
     QPushButton[variant="danger"] {{
@@ -175,43 +288,156 @@ def build_stylesheet() -> str:
 
     QPushButton#NavButton {{
         text-align: left;
-        padding: 10px 14px;
+        padding: 6px 10px;
         border-radius: 10px;
         border: none;
         background: transparent;
+        font-size: 13px;
+        font-weight: 500;
+    }}
+    
+    QPushButton#NavButton:hover {{
+        background: {colors["panel_alt"]};
     }}
 
     QPushButton#NavButton:checked {{
-        background: {colors["accent"]};
-        color: white;
+        background: {colors["accent_light"]};
+        color: {colors["accent"]};
         font-weight: 600;
+    }}
+    
+    QPushButton#NavButton:checked:hover {{
+        background: {colors["accent_light"]};
     }}
 
     QPushButton[variant="seg"] {{
         border-radius: 12px;
         border: 1px solid {colors["border"]};
-        padding: 6px 12px;
-        background: {colors["panel"]};
+        padding: 4px 10px;
+        background: transparent;
+        font-weight: 500;
+        font-size: 12px;
+        min-height: 26px;
+    }}
+    
+    QPushButton[variant="seg"]:hover {{
+        background: {colors["panel_alt"]};
     }}
 
     QPushButton[variant="seg"]:checked {{
-        background: {colors["accent"]};
-        color: white;
-        border: none;
+        background: {colors["accent_light"]};
+        color: {colors["accent"]};
+        border: 1px solid {colors["accent"]};
         font-weight: 600;
+    }}
+    
+    QPushButton[variant="seg"]:checked:hover {{
+        background: {colors["accent_light"]};
     }}
 
     QFrame[card="true"] {{
         background: {colors["panel"]};
         border: 1px solid {colors["border"]};
-        border-radius: 16px;
+        border-radius: 12px;
+    }}
+
+    QFrame[card="true"]:hover {{
+        border: 1px solid {colors["accent"]};
     }}
 
     QFrame[card="true"][selected="true"] {{
         border: 2px solid {colors["accent"]};
+        background: {colors["accent_light"]};
     }}
 
     QLabel[muted="true"] {{
         color: {colors["muted"]};
+    }}
+
+    QSpinBox {{
+        background: {colors["panel"]};
+        border: 1px solid {colors["border"]};
+        border-radius: 12px;
+        padding: 7px 10px;
+    }}
+
+    QSpinBox:focus {{
+        border: 1px solid {colors["accent"]};
+    }}
+
+    QSpinBox::up-button, QSpinBox::down-button {{
+        background: transparent;
+        border: none;
+        width: 16px;
+    }}
+
+    QSpinBox::up-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-bottom: 6px solid {colors["text"]};
+        width: 0;
+        height: 0;
+    }}
+
+    QSpinBox::down-arrow {{
+        image: none;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 6px solid {colors["text"]};
+        width: 0;
+        height: 0;
+    }}
+
+    /* Material 3 Elevation Shadows */
+    QFrame[elevation="1"] {{
+        background: {colors["panel"]};
+        border: none;
+        border-radius: 12px;
+    }}
+
+    QFrame[elevation="2"] {{
+        background: {colors["panel"]};
+        border: none;
+        border-radius: 16px;
+    }}
+
+    QFrame[elevation="3"] {{
+        background: {colors["panel"]};
+        border: none;
+        border-radius: 20px;
+    }}
+
+    /* Status badges */
+    QLabel[status="success"] {{
+        background: {colors["success"]};
+        color: white;
+        border-radius: 12px;
+        padding: 4px 12px;
+        font-weight: 600;
+    }}
+
+    QLabel[status="warning"] {{
+        background: {colors["warning"]};
+        color: white;
+        border-radius: 12px;
+        padding: 4px 12px;
+        font-weight: 600;
+    }}
+
+    QLabel[status="error"] {{
+        background: {colors["danger"]};
+        color: white;
+        border-radius: 12px;
+        padding: 4px 12px;
+        font-weight: 600;
+    }}
+
+    QLabel[status="info"] {{
+        background: {colors["accent"]};
+        color: white;
+        border-radius: 12px;
+        padding: 4px 12px;
+        font-weight: 600;
     }}
     """

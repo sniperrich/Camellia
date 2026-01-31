@@ -38,6 +38,28 @@ class SavedAccount:
             last_used=time.time(),
         )
 
+    @classmethod
+    def new_netease_email(cls, email: str, password: str, remember: bool) -> "SavedAccount":
+        return cls(
+            id=str(uuid.uuid4()),
+            mode="netease_email",
+            username=email,
+            password=password if remember else "",
+            remember_password=remember,
+            last_used=time.time(),
+        )
+
+    @classmethod
+    def new_netease_phone(cls, phone: str) -> "SavedAccount":
+        return cls(
+            id=str(uuid.uuid4()),
+            mode="netease_phone",
+            username=phone,
+            password="",
+            remember_password=False,
+            last_used=time.time(),
+        )
+
     @property
     def key(self) -> str:
         if self.mode == "cookie":
@@ -49,6 +71,12 @@ class SavedAccount:
         if self.mode == "cookie":
             name = Path(self.cookie_path).name if self.cookie_path else "空路径"
             return f"登录凭据文件：{name}"
+        if self.mode == "netease_email":
+            name = self.username or "未知账号"
+            return f"网易邮箱：{name}"
+        if self.mode == "netease_phone":
+            name = self.username or "未知账号"
+            return f"网易手机号：{name}"
         name = self.username or "未知账号"
         return f"4399账号：{name}"
 

@@ -7,7 +7,14 @@ import tempfile
 from typing import Any, Dict, List, Optional
 from urllib.request import urlopen
 
-from ..config import DEFAULT_API_USER_AGENT, FANTNEL_INFO_URL, X19_API_GATEWAY, X19_CORE, X19_MCL
+from ..config import (
+    DEFAULT_API_USER_AGENT,
+    FANTNEL_INFO_FALLBACK_URL,
+    FANTNEL_INFO_URL,
+    X19_API_GATEWAY,
+    X19_CORE,
+    X19_MCL,
+)
 from ..crypto.http_crypto import compute_dynamic_token, http_decrypt, http_encrypt, load_cookie_json
 from .http_client import HttpClient
 from ..models.entities import (
@@ -273,11 +280,28 @@ class WPFLauncherClient:
             raise ApiError(data.get("message", "create character failed"))
 
     def fetch_fantnel_info(self) -> FantnelInfo:
-        response = self.core.get(FANTNEL_INFO_URL)
-        if response.status >= 400:
-            raise ApiError(f"fantnel info error {response.status}")
-        data = json.loads(response.text())
-        return FantnelInfo.from_dict(data)
+        def _fetch(url: str) -> FantnelInfo:
+            response = self.core.get(url)
+            if response.status >= 400:
+                raise ApiError(f"fantnel info error {response.status}")
+            data = json.loads(response.text())
+            payload = data.get("data") if isinstance(data, dict) and "data" in data else data
+            return FantnelInfo.from_dict(payload or {})
+
+        last_err: Exception | None = None
+        try:
+            info = _fetch(FANTNEL_INFO_URL)
+            if info.crc_salt and info.game_version:
+                return info
+        except Exception as exc:  # pylint: disable=broad-except
+            last_err = exc
+
+        try:
+            return _fetch(FANTNEL_INFO_FALLBACK_URL)
+        except Exception as exc:  # pylint: disable=broad-except
+            if last_err:
+                raise ApiError(f"fantnel info fallback failed: {exc}; primary error: {last_err}") from exc
+            raise
 
     def get_free_skins(self, offset: int, length: int = 20) -> List[GameSkin]:
         payload = {
@@ -347,6 +371,8 @@ class WPFLauncherClient:
 
     def get_mod_list(self, game_id: str, version_name: str, include_assets: bool = True) -> ModList:
         mods: Dict[str, Mod] = {}
+        core_count = 0
+        asset_count = 0
         version_id = _GAME_VERSION_IDS.get(version_name)
         if version_id is None:
             self._logger.warning("Unknown game version for core mods: %s", version_name)
@@ -374,13 +400,24 @@ class WPFLauncherClient:
                             md5=str(jar_md5).upper(),
                             version="",
                         )
+            core_count = len(mods)
 
         if include_assets:
             try:
-                mods.update(self._get_server_asset_mods(game_id))
+                asset_mods = self._get_server_asset_mods(game_id)
+                asset_count = len(asset_mods)
+                mods.update(asset_mods)
             except ModFetchError as exc:
                 self._logger.warning("Server asset mods skipped: %s", exc)
 
+        self._logger.info(
+            "Mod list built: game_id=%s version=%s core=%s assets=%s total=%s",
+            game_id,
+            version_name,
+            core_count,
+            asset_count,
+            len(mods),
+        )
         return ModList(list(mods.values()))
 
     def _get_server_asset_mods(self, game_id: str) -> Dict[str, Mod]:

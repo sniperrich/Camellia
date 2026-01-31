@@ -2,8 +2,10 @@
 
 from .events import (
     AnimationEvent,
+    ChatMessageEvent,
     LoginSuccessEvent,
     PacketDirection,
+    PlayerPositionEvent,
     PluginEventBus,
     PluginMessageEvent,
     get_event_bus,
@@ -23,8 +25,10 @@ __all__ = [
     "PluginMeta",
     "PluginState",
     "AnimationEvent",
+    "ChatMessageEvent",
     "LoginSuccessEvent",
     "PacketDirection",
+    "PlayerPositionEvent",
     "PluginMessageEvent",
     "get_event_bus",
     "get_plugin_manager",

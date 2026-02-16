@@ -99,9 +99,9 @@ class PacketLogger:
         self._logger = logger
         self._handle: Optional[Any] = None
         self._path: Optional[str] = None
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "logs"))
         session_id = f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}-{id(self):x}"
         try:
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "logs"))
             os.makedirs(base_dir, exist_ok=True)
             self._path = os.path.join(base_dir, f"packets-{session_id}.log")
             self._handle = open(self._path, "a", encoding="utf-8", buffering=1)
@@ -156,6 +156,7 @@ class MinecraftProxy:
         self._server = await asyncio.start_server(self._handle_client, self.config.listen_host, self.config.listen_port)
         addrs = ", ".join(str(sock.getsockname()) for sock in self._server.sockets or [])
         self._logger.info("Proxy listening on %s -> %s:%s", addrs, self.config.forward_host, self.config.forward_port)
+        self._logger.info("[ProxyPhase] listening %s -> %s:%s", addrs, self.config.forward_host, self.config.forward_port)
         return self._server
 
     async def serve(self) -> None:
@@ -172,13 +173,17 @@ class MinecraftProxy:
     async def _handle_client(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter) -> None:
         peer = client_writer.get_extra_info("peername")
         self._logger.info("Client connected: %s", peer)
+        self._logger.info("[ProxyPhase] client connected %s", peer)
         try:
+            self._logger.info("[ProxyPhase] connecting server %s:%s", self.config.forward_host, self.config.forward_port)
             server_reader, server_writer = await asyncio.open_connection(self.config.forward_host, self.config.forward_port)
         except OSError as exc:
             self._logger.error("Failed to connect to server: %s", exc)
+            self._logger.warning("[ProxyPhase] connect failed: %s", exc)
             client_writer.close()
             await client_writer.wait_closed()
             return
+        self._logger.info("[ProxyPhase] server connected %s:%s", self.config.forward_host, self.config.forward_port)
 
         session = _ProxySession(self.config, client_reader, client_writer, server_reader, server_writer, self._logger)
         await session.run()
@@ -232,8 +237,16 @@ class _ProxySession:
         self.player_pos: tuple[float, float, float] | None = None
         self.player_rot: tuple[float, float] | None = None
         self.player_on_ground: bool | None = None
+        self._session_id = f"{self.config.nickname}-{id(self):x}"
+
+    def _phase(self, message: str) -> None:
+        self.logger.info("[ProxyPhase] %s %s", self._session_id, message)
 
     async def run(self) -> None:
+        self._phase(
+            f"session start listen={self.config.listen_host}:{self.config.listen_port} "
+            f"forward={self.config.forward_host}:{self.config.forward_port}"
+        )
         client_task = asyncio.create_task(self._client_loop())
         server_task = asyncio.create_task(self._server_loop())
         done, pending = await asyncio.wait({client_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -244,6 +257,7 @@ class _ProxySession:
             if exc:
                 self.logger.debug("Session task ended with error: %s", exc)
         await self._close()
+        self._phase("session closed")
 
     async def _close(self) -> None:
         self._closed = True
@@ -261,6 +275,7 @@ class _ProxySession:
         while True:
             data = await self.client_reader.read(4096)
             if not data:
+                self._phase("client stream closed")
                 break
             for frame in self._client_framer.feed(data):
                 raw_payload = frame.payload
@@ -295,6 +310,7 @@ class _ProxySession:
         while True:
             data = await self.server_reader.read(4096)
             if not data:
+                self._phase("server stream closed")
                 break
             if self._cipher is not None:
                 data = self._cipher.decrypt(data)
@@ -575,12 +591,15 @@ class _ProxySession:
 
     async def _handle_client_packet(self, packet_id: int, payload: bytes, body: bytes) -> Optional[bytes]:
         if self.state == ConnectionState.HANDSHAKE and packet_id == 0:
+            self._phase("client handshake")
             return self._rewrite_handshake(body)
         if self.state == ConnectionState.LOGIN and packet_id == 0:
+            self._phase("client login start")
             return self._rewrite_login_start(body)
         if self.state == ConnectionState.LOGIN and packet_id == 3 and self._is_proto(ProtocolVersion.V1206):
             self.state = ConnectionState.CONFIGURATION
             self.logger.info("Client login acknowledged, entering configuration")
+            self._phase("client login ack -> configuration")
             return payload
         if self.state == ConnectionState.CONFIGURATION and self._is_proto(ProtocolVersion.V1206):
             config_plugin_id = self._get_plugin_message_id(PacketDirection.SERVERBOUND)
@@ -589,6 +608,7 @@ class _ProxySession:
         if self.state == ConnectionState.CONFIGURATION and packet_id == 3:
             self.state = ConnectionState.PLAY
             self.logger.info("Client finished configuration, entering play")
+            self._phase("client finished configuration -> play")
             await self._emit_login_success()
             return payload
         if self.state == ConnectionState.PLAY:
@@ -795,17 +815,21 @@ class _ProxySession:
 
     async def _handle_server_packet(self, packet_id: int, payload: bytes, body: bytes) -> Optional[bytes]:
         if self.state == ConnectionState.LOGIN and packet_id == 1:
+            self._phase("server encryption request")
             await self._handle_encryption_request(body)
             return None
         if self.state == ConnectionState.LOGIN and packet_id == 0:
+            self._phase("server login disconnect")
             self._handle_disconnect(body)
             return payload
         if self.state == ConnectionState.LOGIN and packet_id == 3 and self.protocol_version != ProtocolVersion.V1076:
+            self._phase("server set compression")
             self._handle_set_compression(body)
             await self._send_to_client(payload, force_uncompressed=True)
             self.client_compression_threshold = self.server_compression_threshold
             return None
         if self.state == ConnectionState.LOGIN and packet_id == 2:
+            self._phase("server login success")
             await self._handle_login_success()
             return payload
         if self.state == ConnectionState.CONFIGURATION and self._is_proto(ProtocolVersion.V1206):
@@ -813,10 +837,39 @@ class _ProxySession:
             if config_plugin_id is not None and packet_id == config_plugin_id:
                 return await self._handle_plugin_message(PacketDirection.CLIENTBOUND, packet_id, payload, body)
         if self.state == ConnectionState.PLAY and packet_id == self._get_play_disconnect_id():
+            self._phase("server play disconnect")
             self._handle_disconnect(body)
             return payload
         if self.state == ConnectionState.PLAY:
             if self.protocol_version == int(ProtocolVersion.V108X):
+                if packet_id == 0x26 and len(payload) > 0x200000:
+                    try:
+                        split_packets = self._split_chunk_bulk_v108x(packet_id, body)
+                    except ProtocolError as exc:
+                        self.logger.warning(
+                            "Chunk bulk split failed (payload=%s body=%s): %s",
+                            len(payload),
+                            len(body),
+                            exc,
+                        )
+                        self.logger.warning("Dropping oversized chunk bulk to avoid client disconnect")
+                        return None
+                    else:
+                        self.logger.warning(
+                            "Chunk bulk too large (%s bytes), split into %s packets",
+                            len(payload),
+                            len(split_packets),
+                        )
+                        for packet in split_packets:
+                            await self._send_to_client(packet)
+                        return None
+                if len(payload) > 0x200000:
+                    self.logger.warning(
+                        "Oversized v108x packet id=0x%02X payload=%s; dropping to avoid client disconnect",
+                        packet_id,
+                        len(payload),
+                    )
+                    return None
                 if packet_id == 0x3F:
                     return await self._handle_plugin_message(PacketDirection.CLIENTBOUND, packet_id, payload, body)
                 sanitized = self._sanitize_clientbound_play_v108x(packet_id, body)
@@ -866,6 +919,7 @@ class _ProxySession:
         if self.state == ConnectionState.PLAY and packet_id == 105 and self._is_proto(ProtocolVersion.V1206):
             self.state = ConnectionState.CONFIGURATION
             self.logger.info("Server started configuration")
+            self._phase("server started configuration")
             return payload
         return payload
 
@@ -885,6 +939,7 @@ class _ProxySession:
             self.state = ConnectionState(next_state)
         except ValueError:
             self.state = ConnectionState.HANDSHAKE
+        self._phase(f"handshake proto={protocol} next_state={self.state.name}")
 
         new_addr = _with_fml_marker(protocol, self.config.forward_host)
         self.logger.debug("Handshake addr %s -> %s", _safe_b64(server_addr), _safe_b64(new_addr))
@@ -932,6 +987,7 @@ class _ProxySession:
             _profile, size = read_string(body, offset, 16)
             offset += size
             new_body = write_string(nickname, 16)
+        self._phase(f"rewrite login start proto={int(proto)} nickname={nickname}")
         return write_varint(0) + new_body
 
     async def _handle_encryption_request(self, body: bytes) -> None:
@@ -939,31 +995,38 @@ class _ProxySession:
             self.logger.warning("Encryption request received before handshake")
             return
         server_id, public_key, verify_token, _should_auth = _parse_encryption_request(body, self.protocol_version)
+        self._phase(f"encryption request server_id_len={len(server_id)} should_auth={_should_auth}")
         secret_key = os.urandom(16)
         server_hash = _compute_server_hash(server_id, secret_key, public_key)
 
         if self.config.ygg_profile and self.config.ygg_data:
+            self._phase(f"yggdrasil join server_hash={server_hash[:12]}...")
             await self._join_yggdrasil(server_hash)
         else:
             self.logger.warning("Yggdrasil profile missing; skipping join")
+            self._phase("yggdrasil join skipped (missing profile)")
 
         response_body = _build_encryption_response(self.protocol_version, secret_key, public_key, verify_token)
         response_payload = write_varint(1) + response_body
         await self._send_to_server(response_payload, force_uncompressed=True, force_unencrypted=True)
         self._cipher = _Cfb8Cipher(secret_key)
         self.logger.info("Encryption enabled for server connection")
+        self._phase("encryption enabled")
 
     def _handle_set_compression(self, body: bytes) -> None:
         threshold, _ = read_varint(body, 0)
         self.server_compression_threshold = threshold
         self.logger.info("Compression enabled, threshold=%s", threshold)
+        self._phase(f"compression enabled threshold={threshold}")
 
     async def _handle_login_success(self) -> None:
         if self._is_proto(ProtocolVersion.V1206):
             self.logger.info("Login success (configuration flow)")
+            self._phase("login success (configuration flow)")
             return
         self.state = ConnectionState.PLAY
         self.logger.info("Login success, entering play")
+        self._phase("login success -> play")
         await self._emit_login_success()
 
     def _get_play_disconnect_id(self) -> Optional[int]:
@@ -979,6 +1042,7 @@ class _ProxySession:
         except ProtocolError:
             reason = "<parse failed>"
         self.logger.warning("Server disconnect: %s", reason)
+        self._phase(f"disconnect reason={reason}")
 
     def _is_proto(self, proto: ProtocolVersion) -> bool:
         if self.protocol_version is None:
@@ -1190,6 +1254,63 @@ class _ProxySession:
                 out += write_string(mapped_player, 16)
         return bytes(out) if changed else None
 
+    def _split_chunk_bulk_v108x(self, packet_id: int, body: bytes) -> list[bytes]:
+        offset = 0
+        skylight, size = read_bool(body, offset)
+        offset += size
+        count, size = read_varint(body, offset)
+        offset += size
+        metas: list[tuple[int, int, int, int]] = []
+        for _ in range(count):
+            if offset + 12 > len(body):
+                raise ProtocolError("chunk bulk meta out of range")
+            chunk_x = int.from_bytes(body[offset : offset + 4], "big", signed=True)
+            offset += 4
+            chunk_z = int.from_bytes(body[offset : offset + 4], "big", signed=True)
+            offset += 4
+            primary = int.from_bytes(body[offset : offset + 2], "big")
+            offset += 2
+            add = int.from_bytes(body[offset : offset + 2], "big")
+            offset += 2
+            metas.append((chunk_x, chunk_z, primary, add))
+
+        data_blob = body[offset:]
+        if len(data_blob) >= 4:
+            possible_len = int.from_bytes(data_blob[:4], "big", signed=False)
+            if possible_len == len(data_blob) - 4:
+                data_blob = data_blob[4:]
+        data_offset = 0
+        chunks: list[tuple[int, int, int, int, bytes]] = []
+        # 1.8.9 chunk section layout:
+        # blocks: 4096 * 2 bytes (12-bit packed) = 8192
+        # block light: 2048
+        # sky light: 2048 (if skylight)
+        section_size = 8192 + 2048 + (2048 if skylight else 0)
+        for chunk_x, chunk_z, primary, add in metas:
+            section_count = primary.bit_count()
+            add_count = add.bit_count()
+            chunk_size = section_count * section_size + add_count * 2048 + 256
+            end = data_offset + chunk_size
+            if end > len(data_blob):
+                raise ProtocolError("chunk bulk data out of range")
+            chunks.append((chunk_x, chunk_z, primary, add, data_blob[data_offset:end]))
+            data_offset = end
+        if data_offset != len(data_blob):
+            raise ProtocolError("chunk bulk trailing data")
+
+        packets: list[bytes] = []
+        for chunk_x, chunk_z, primary, add, chunk_data in chunks:
+            body_out = bytearray()
+            body_out.append(1 if skylight else 0)
+            body_out += write_varint(1)
+            body_out += int(chunk_x).to_bytes(4, "big", signed=True)
+            body_out += int(chunk_z).to_bytes(4, "big", signed=True)
+            body_out += int(primary).to_bytes(2, "big")
+            body_out += int(add).to_bytes(2, "big")
+            body_out += chunk_data
+            packets.append(write_varint(packet_id) + bytes(body_out))
+        return packets
+
     def _map_name(self, category: str, value: str, max_len: int) -> str:
         if len(value) <= max_len:
             return value
@@ -1253,25 +1374,33 @@ class _ProxySession:
                     )
                     if ok:
                         successes.append(f"{host}:{port} {strategy_name}/{wire_name}")
-                        print(
-                            "Yggdrasil join success (%s/%s) via %s:%s"
-                            % (strategy_name, wire_name, host, port)
+                        self.logger.info(
+                            "Yggdrasil join success (%s/%s) via %s:%s",
+                            strategy_name,
+                            wire_name,
+                            host,
+                            port,
                         )
                         if failures:
-                            print(
-                                "Yggdrasil attempts before success (%d): %s"
-                                % (len(failures), _summarize(failures))
+                            self.logger.info(
+                                "Yggdrasil attempts before success (%d): %s",
+                                len(failures),
+                                _summarize(failures),
                             )
-                        print("Yggdrasil auth success list: %s" % _summarize(successes))
+                        self.logger.info("Yggdrasil auth success list: %s", _summarize(successes))
                         return
                     failures.append(f"{host}:{port} {strategy_name}/{wire_name}")
-                    print(
-                        "Yggdrasil join failed (%s/%s) via %s:%s: %s"
-                        % (strategy_name, wire_name, host, port, err)
+                    self.logger.debug(
+                        "Yggdrasil join failed (%s/%s) via %s:%s: %s",
+                        strategy_name,
+                        wire_name,
+                        host,
+                        port,
+                        err,
                     )
-        print("Yggdrasil join failed across all strategies")
+        self.logger.warning("Yggdrasil join failed across all strategies")
         if failures:
-            print("Yggdrasil auth failed list (%d): %s" % (len(failures), _summarize(failures)))
+            self.logger.warning("Yggdrasil auth failed list (%d): %s", len(failures), _summarize(failures))
 
     @staticmethod
     def _build_auth_strategies(profile: GameProfile) -> list[tuple[str, GameProfile]]:

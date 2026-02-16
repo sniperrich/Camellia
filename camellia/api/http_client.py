@@ -1,5 +1,6 @@
 import gzip
 import json
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
@@ -27,15 +28,20 @@ class HttpClient:
         default_headers: Optional[Dict[str, str]] = None,
         timeout: int = 30,
         cookie_jar: Optional[CookieJar] = None,
+        ignore_system_proxy: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.default_headers = default_headers or {}
         self.timeout = timeout
         self.cookie_jar = cookie_jar
-        if cookie_jar is None:
-            self._opener = urllib.request.build_opener()
-        else:
-            self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+        # By default urllib honors environment/registry proxies. That breaks in some
+        # Windows setups (e.g. stale VPN/system proxy) and can surface as WinSock
+        # errors 10049/10054 or SSL handshake failures. We allow opting out.
+        proxy_handler = urllib.request.ProxyHandler({}) if ignore_system_proxy else urllib.request.ProxyHandler()
+        handlers = [proxy_handler]
+        if cookie_jar is not None:
+            handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def _build_url(self, path: str, params: Optional[Dict[str, str]] = None) -> str:
         if path.startswith("http://") or path.startswith("https://"):
@@ -53,13 +59,15 @@ class HttpClient:
             merged.update(headers)
         return merged
 
-    def _read_response(self, resp: urllib.response.addinfourl) -> HttpResponse:
+    def _read_response(self, resp: Any) -> HttpResponse:
         body = resp.read()
-        encoding = resp.headers.get("Content-Encoding", "")
-        if encoding.lower() == "gzip":
+        encoding = getattr(resp, "headers", {}).get("Content-Encoding", "")
+        if isinstance(encoding, str) and encoding.lower() == "gzip":
             body = gzip.decompress(body)
-        headers = {k: v for k, v in resp.headers.items()}
-        return HttpResponse(resp.status, headers, body, resp.geturl())
+        headers = {k: v for k, v in getattr(resp, "headers", {}).items()}
+        status = getattr(resp, "status", None) or getattr(resp, "code", 0) or 0
+        url = resp.geturl() if hasattr(resp, "geturl") else ""
+        return HttpResponse(int(status), headers, body, url)
 
     def get(self, path: str, params: Optional[Dict[str, str]] = None,
             headers: Optional[Dict[str, str]] = None) -> HttpResponse:
@@ -67,7 +75,10 @@ class HttpClient:
         request = urllib.request.Request(url, method="GET")
         for k, v in self._merge_headers(headers).items():
             request.add_header(k, v)
-        resp = self._opener.open(request, timeout=self.timeout)
+        try:
+            resp = self._opener.open(request, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:
+            resp = exc
         return self._read_response(resp)
 
     def post(
@@ -84,7 +95,10 @@ class HttpClient:
             merged["Content-Type"] = content_type
         for k, v in merged.items():
             request.add_header(k, v)
-        resp = self._opener.open(request, timeout=self.timeout)
+        try:
+            resp = self._opener.open(request, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:
+            resp = exc
         return self._read_response(resp)
 
     def post_json(self, path: str, payload: Any,

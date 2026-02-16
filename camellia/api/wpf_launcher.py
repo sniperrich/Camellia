@@ -1,4 +1,5 @@
 import hashlib
+import time
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional
 from urllib.request import urlopen
+from pathlib import Path
 
 from ..config import (
     DEFAULT_API_USER_AGENT,
@@ -432,7 +434,13 @@ class WPFLauncherClient:
         res_url = sub_entities[0].get("res_url")
         if not res_url:
             return {}
-        return _download_mods_from_archive(res_url)
+        cached = _load_mod_cache(res_url)
+        if cached is not None:
+            self._logger.info("Asset mod cache hit: %s (%s mods)", res_url, len(cached))
+            return cached
+        mods = _download_mods_from_archive(res_url)
+        _save_mod_cache(res_url, mods)
+        return mods
 
 
 def _download_mods_from_archive(res_url: str) -> Dict[str, Mod]:
@@ -470,6 +478,68 @@ def _download_mods_from_archive(res_url: str) -> Dict[str, Mod]:
                 version="",
             )
         return mods
+
+
+_MOD_CACHE_DIR = Path.home() / ".camellia" / "mods_cache"
+
+
+def _mod_cache_path(res_url: str) -> Path:
+    digest = hashlib.sha1(res_url.encode("utf-8")).hexdigest()
+    return _MOD_CACHE_DIR / f"mods_{digest}.json"
+
+
+def _load_mod_cache(res_url: str) -> Optional[Dict[str, Mod]]:
+    try:
+        _MOD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    cache_path = _mod_cache_path(res_url)
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("res_url") != res_url:
+        return None
+    mods_raw = payload.get("mods")
+    if not isinstance(mods_raw, list):
+        return None
+    mods: Dict[str, Mod] = {}
+    for item in mods_raw:
+        if not isinstance(item, dict):
+            continue
+        mod_path = str(item.get("modPath", ""))
+        md5 = str(item.get("md5", "")).upper()
+        iid = str(item.get("iid", ""))
+        if not mod_path or not md5:
+            continue
+        mods[mod_path] = Mod(
+            modPath=mod_path,
+            name=str(item.get("name", "")),
+            id=str(item.get("id", mod_path)),
+            iid=iid,
+            md5=md5,
+            version=str(item.get("version", "")),
+        )
+    return mods or None
+
+
+def _save_mod_cache(res_url: str, mods: Dict[str, Mod]) -> None:
+    try:
+        _MOD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    cache_path = _mod_cache_path(res_url)
+    payload = {
+        "res_url": res_url,
+        "fetched_at": int(time.time()),
+        "mods": [mod.to_dict() for mod in mods.values()],
+    }
+    try:
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        return
 
 
 def _download_file(url: str, dest: str) -> None:

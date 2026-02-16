@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets, QtSvg
 
 from .theme import PALETTE
 from ..plugins import PluginState
@@ -30,6 +31,32 @@ def _draw_camellia(
         painter.drawEllipse(center + offset, petal_radius, petal_radius)
     painter.setBrush(core_color)
     painter.drawEllipse(center, petal_radius * 0.9, petal_radius * 0.9)
+
+
+_ICON_DIR = Path(__file__).resolve().parent / "assets" / "icons"
+
+
+def load_svg_icon(name: str, size: int, color: QtGui.QColor) -> QtGui.QIcon | None:
+    path = _ICON_DIR / f"{name}.svg"
+    if not path.exists():
+        return None
+    svg_text = path.read_text(encoding="utf-8")
+    svg_text = svg_text.replace("currentColor", color.name())
+    renderer = QtSvg.QSvgRenderer(bytearray(svg_text, encoding="utf-8"))
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
+def apply_drop_shadow(widget: QtWidgets.QWidget, color: tuple[int, int, int, int] = (0, 0, 0, 40), blur_radius: int = 28, offset: tuple[int, int] = (0, 8)) -> None:
+    shadow = QtWidgets.QGraphicsDropShadowEffect(widget)
+    shadow.setColor(QtGui.QColor(*color))
+    shadow.setBlurRadius(blur_radius)
+    shadow.setOffset(*offset)
+    widget.setGraphicsEffect(shadow)
 
 
 class Backdrop(QtWidgets.QWidget):
@@ -80,15 +107,20 @@ class CamelliaLogo(QtWidgets.QWidget):
 
 
 def make_nav_icon(kind: str, size: int = 18, active: bool = False) -> QtGui.QIcon:
+    if active:
+        color = QtGui.QColor(PALETTE["accent"])
+    else:
+        color = QtGui.QColor(PALETTE.get("text_secondary", PALETTE["muted"]))
+
+    svg_icon = load_svg_icon(f"nav_{kind}", size, color)
+    if svg_icon is not None:
+        return svg_icon
+
     pixmap = QtGui.QPixmap(size, size)
     pixmap.fill(QtCore.Qt.transparent)
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
-    if active:
-        color = QtGui.QColor(PALETTE["accent"])
-    else:
-        color = QtGui.QColor(PALETTE.get("text_secondary", PALETTE["muted"]))
     accent = QtGui.QColor(PALETTE["accent"])
     pen = QtGui.QPen(color, 1.6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
     painter.setPen(pen)
@@ -658,37 +690,43 @@ class PortInputWithStatus(QtWidgets.QWidget):
     """
     Material 3 style port input with availability status indicator.
 
-    Shows a green checkmark if port is available, red X if not.
+    Shows a tonal status pill for port availability.
     """
 
     port_changed = QtCore.Signal(int)
 
-    def __init__(self, default_port: int = 6445, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(self, default_port: int = 25570, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
 
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        # Port input
         self.port_input = QtWidgets.QSpinBox()
         self.port_input.setRange(1024, 65535)
         self.port_input.setValue(default_port)
+        self.port_input.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.port_input.setMinimumWidth(140)
         self.port_input.valueChanged.connect(self._on_port_changed)
-        layout.addWidget(self.port_input)
+        layout.addWidget(self.port_input, 1)
 
-        # Status indicator
-        self.status_label = QtWidgets.QLabel("✓")
-        self.status_label.setFixedSize(20, 20)
-        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.status_label.setStyleSheet(f"""
-            QLabel {{
-                color: {PALETTE['accent']};
-                font-size: 16px;
-                font-weight: bold;
-            }}
-        """)
-        layout.addWidget(self.status_label)
+        self.status_pill = QtWidgets.QFrame()
+        self.status_pill.setFixedHeight(28)
+        self.status_pill.setObjectName("PortStatusPill")
+        pill_layout = QtWidgets.QHBoxLayout(self.status_pill)
+        pill_layout.setContentsMargins(10, 2, 10, 2)
+        pill_layout.setSpacing(6)
+
+        self.status_dot = QtWidgets.QLabel()
+        self.status_dot.setFixedSize(8, 8)
+        self.status_dot.setAlignment(QtCore.Qt.AlignCenter)
+
+        self.status_text = QtWidgets.QLabel("检测中")
+        self.status_text.setStyleSheet("font-size: 12px; font-weight: 600;")
+
+        pill_layout.addWidget(self.status_dot)
+        pill_layout.addWidget(self.status_text)
+        layout.addWidget(self.status_pill, 0, QtCore.Qt.AlignVCenter)
 
         # Check initial port
         self._check_port_availability()
@@ -705,24 +743,31 @@ class PortInputWithStatus(QtWidgets.QWidget):
         port = self.port_input.value()
         available = is_port_available(port)
 
+        self._set_status(available)
+
+    def _set_status(self, available: bool) -> None:
         if available:
-            self.status_label.setText("✓")
-            self.status_label.setStyleSheet(f"""
-                QLabel {{
-                    color: #2E7D32;
-                    font-size: 16px;
-                    font-weight: bold;
+            self.status_text.setText("端口可用")
+            self.status_pill.setStyleSheet(f"""
+                #PortStatusPill {{
+                    background: rgba(46, 125, 50, 0.12);
+                    border: 1px solid rgba(46, 125, 50, 0.25);
+                    border-radius: 14px;
                 }}
             """)
+            self.status_text.setStyleSheet("font-size: 12px; font-weight: 600; color: #2E7D32;")
+            self.status_dot.setStyleSheet("background: #2E7D32; border-radius: 4px;")
         else:
-            self.status_label.setText("✗")
-            self.status_label.setStyleSheet(f"""
-                QLabel {{
-                    color: #C62828;
-                    font-size: 16px;
-                    font-weight: bold;
+            self.status_text.setText("端口占用")
+            self.status_pill.setStyleSheet(f"""
+                #PortStatusPill {{
+                    background: rgba(198, 40, 40, 0.12);
+                    border: 1px solid rgba(198, 40, 40, 0.25);
+                    border-radius: 14px;
                 }}
             """)
+            self.status_text.setStyleSheet("font-size: 12px; font-weight: 600; color: #C62828;")
+            self.status_dot.setStyleSheet("background: #C62828; border-radius: 4px;")
 
     def value(self) -> int:
         """Get the current port value."""
@@ -731,3 +776,163 @@ class PortInputWithStatus(QtWidgets.QWidget):
     def setValue(self, port: int) -> None:
         """Set the port value."""
         self.port_input.setValue(port)
+
+
+class MaterialComboBox(QtWidgets.QComboBox):
+    """
+    Custom-drawn Material 3 combo box to avoid platform arrow artifacts.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(30)
+        self.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self._hovered = False
+        self._hover_value = 0.0
+        self._hover_anim = QtCore.QPropertyAnimation(self, b"hover_value")
+        self._hover_anim.setDuration(160)
+        self._hover_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self.setStyleSheet(
+            "QComboBox { background: transparent; border: none; }"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox::down-arrow { image: none; }"
+        )
+
+        self._popup_view = QtWidgets.QListView()
+        self._popup_view.setSpacing(2)
+        self._popup_view.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._popup_view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._popup_view.setStyleSheet(
+            f"""
+            QListView {{
+                background: transparent;
+                border: none;
+                padding: 4px;
+            }}
+            QListView::item {{
+                padding: 4px 8px;
+                border-radius: 6px;
+            }}
+            QListView::item:hover {{
+                background: {PALETTE['surface_variant']};
+            }}
+            QListView::item:selected {{
+                background: {PALETTE['accent_light']};
+                color: {PALETTE['text']};
+            }}
+            """
+        )
+        self.setView(self._popup_view)
+
+        self._popup_anim: QtCore.QPropertyAnimation | None = None
+        self._popup_geom_anim: QtCore.QPropertyAnimation | None = None
+
+    def get_hover_value(self) -> float:
+        return self._hover_value
+
+    def set_hover_value(self, value: float) -> None:
+        self._hover_value = value
+        self.update()
+
+    hover_value = QtCore.Property(float, get_hover_value, set_hover_value)
+
+    def enterEvent(self, event: QtCore.QEvent) -> None:
+        self._hovered = True
+        self._start_hover_anim(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._hovered = False
+        self._start_hover_anim(0.0)
+        super().leaveEvent(event)
+
+    def _start_hover_anim(self, target: float) -> None:
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self._hover_value)
+        self._hover_anim.setEndValue(target)
+        self._hover_anim.start()
+
+    @staticmethod
+    def _mix_color(a: QtGui.QColor, b: QtGui.QColor, t: float) -> QtGui.QColor:
+        t = max(0.0, min(1.0, t))
+        return QtGui.QColor(
+            int(a.red() + (b.red() - a.red()) * t),
+            int(a.green() + (b.green() - a.green()) * t),
+            int(a.blue() + (b.blue() - a.blue()) * t),
+        )
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        rect = self.rect()
+        radius = 6
+        border_color = QtGui.QColor(PALETTE["accent"] if self.hasFocus() else PALETTE["border"])
+        base_bg = QtGui.QColor(PALETTE["panel_alt"])
+        hover_bg = QtGui.QColor(PALETTE["panel"])
+        bg_color = self._mix_color(base_bg, hover_bg, self._hover_value)
+        text_color = QtGui.QColor(PALETTE["text"] if self.isEnabled() else PALETTE["muted"])
+
+        pen = QtGui.QPen(border_color, 1)
+        painter.setPen(pen)
+        painter.setBrush(bg_color)
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), radius, radius)
+
+        if self.hasFocus():
+            underline_pen = QtGui.QPen(QtGui.QColor(PALETTE["accent"]), 2)
+            painter.setPen(underline_pen)
+            painter.drawLine(rect.left() + 8, rect.bottom() - 2, rect.right() - 8, rect.bottom() - 2)
+
+        drop_width = 22
+        divider_x = rect.right() - drop_width
+        divider_pen = QtGui.QPen(QtGui.QColor(PALETTE["border"]), 1)
+        painter.setPen(divider_pen)
+        painter.drawLine(divider_x, rect.top() + 6, divider_x, rect.bottom() - 6)
+
+        # Text
+        text_rect = rect.adjusted(10, 0, -(drop_width + 6), 0)
+        painter.setPen(text_color)
+        painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, self.currentText())
+
+        # Arrow
+        arrow_center = QtCore.QPoint(rect.right() - drop_width // 2, rect.center().y())
+        arrow_size = 4
+        arrow_path = QtGui.QPainterPath()
+        arrow_path.moveTo(arrow_center.x() - arrow_size, arrow_center.y() - 1)
+        arrow_path.lineTo(arrow_center.x() + arrow_size, arrow_center.y() - 1)
+        arrow_path.lineTo(arrow_center.x(), arrow_center.y() + arrow_size)
+        arrow_path.closeSubpath()
+        painter.setBrush(QtGui.QColor(PALETTE["text_secondary"]))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawPath(arrow_path)
+
+        painter.end()
+
+    def showPopup(self) -> None:
+        super().showPopup()
+        popup = self.view().window()
+        popup.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        popup.setStyleSheet(
+            f"""
+            background: {PALETTE['panel']};
+            border: 1px solid {PALETTE['border']};
+            border-radius: 12px;
+            """
+        )
+        popup.setWindowOpacity(0.0)
+        self._popup_anim = QtCore.QPropertyAnimation(popup, b"windowOpacity")
+        self._popup_anim.setDuration(140)
+        self._popup_anim.setStartValue(0.0)
+        self._popup_anim.setEndValue(1.0)
+        self._popup_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._popup_anim.start()
+
+        end_geom = popup.geometry()
+        start_geom = QtCore.QRect(end_geom)
+        start_geom.moveTop(end_geom.top() - 6)
+        self._popup_geom_anim = QtCore.QPropertyAnimation(popup, b"geometry")
+        self._popup_geom_anim.setDuration(140)
+        self._popup_geom_anim.setStartValue(start_geom)
+        self._popup_geom_anim.setEndValue(end_geom)
+        self._popup_geom_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._popup_geom_anim.start()

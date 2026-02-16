@@ -29,13 +29,13 @@ def is_port_available(port: int, host: str = '127.0.0.1') -> bool:
         return False
 
 
-def find_available_port(start_port: int = 6445, end_port: int = 65535,
+def find_available_port(start_port: int = 25570, end_port: int = 65535,
                        exclude_ports: Optional[List[int]] = None) -> Optional[int]:
     """
     Find the first available port in the given range.
 
     Args:
-        start_port: Starting port number (default: 6445)
+        start_port: Starting port number (default: 25570)
         end_port: Ending port number (default: 65535)
         exclude_ports: List of ports to exclude from search
 
@@ -53,7 +53,7 @@ def find_available_port(start_port: int = 6445, end_port: int = 65535,
     return None
 
 
-def get_next_suggested_port(used_ports: List[int], default_port: int = 6445) -> int:
+def get_next_suggested_port(used_ports: List[int], default_port: int = 25570) -> int:
     """
     Get the next suggested port based on currently used ports.
 

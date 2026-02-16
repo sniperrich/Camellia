@@ -20,6 +20,8 @@ class SavedAccount:
     cookie_path: str = ""
     username: str = ""
     password: str = ""
+    remark: str = ""
+    sub_mode: str = ""
     remember_password: bool = False
     last_used: float = 0.0
 
@@ -28,35 +30,50 @@ class SavedAccount:
         return cls(id=str(uuid.uuid4()), mode="cookie", cookie_path=path, last_used=time.time())
 
     @classmethod
-    def new_account(cls, username: str, password: str, remember: bool) -> "SavedAccount":
+    def new_account(cls, username: str, password: str, remember: bool, remark: str = "") -> "SavedAccount":
         return cls(
             id=str(uuid.uuid4()),
             mode="account",
             username=username,
             password=password if remember else "",
+            remark=remark,
             remember_password=remember,
             last_used=time.time(),
         )
 
     @classmethod
-    def new_netease_email(cls, email: str, password: str, remember: bool) -> "SavedAccount":
+    def new_netease_email(
+        cls, email: str, password: str, remember: bool, remark: str = ""
+    ) -> "SavedAccount":
         return cls(
             id=str(uuid.uuid4()),
             mode="netease_email",
             username=email,
             password=password if remember else "",
+            remark=remark,
             remember_password=remember,
             last_used=time.time(),
         )
 
     @classmethod
-    def new_netease_phone(cls, phone: str) -> "SavedAccount":
+    def new_netease_phone(
+        cls,
+        phone: str,
+        *,
+        login_mode: str = "sms",
+        password: str = "",
+        remember: bool = False,
+        remark: str = "",
+    ) -> "SavedAccount":
+        sub_mode = "password" if login_mode == "password" else "sms"
         return cls(
             id=str(uuid.uuid4()),
             mode="netease_phone",
             username=phone,
-            password="",
-            remember_password=False,
+            password=password if remember else "",
+            remark=remark,
+            sub_mode=sub_mode,
+            remember_password=remember,
             last_used=time.time(),
         )
 
@@ -68,17 +85,23 @@ class SavedAccount:
 
     @property
     def label(self) -> str:
+        # One-line label for list UI; keep it compact but include remark if present.
         if self.mode == "cookie":
             name = Path(self.cookie_path).name if self.cookie_path else "空路径"
-            return f"登录凭据文件：{name}"
+            base = f"登录凭据文件：{name}"
+            return f"{base} · {self.remark}" if self.remark else base
         if self.mode == "netease_email":
             name = self.username or "未知账号"
-            return f"网易邮箱：{name}"
+            base = f"网易邮箱：{name}"
+            return f"{base} · {self.remark}" if self.remark else base
         if self.mode == "netease_phone":
             name = self.username or "未知账号"
-            return f"网易手机号：{name}"
+            prefix = "网易手机号（密码）" if self.sub_mode == "password" else "网易手机号"
+            base = f"{prefix}：{name}"
+            return f"{base} · {self.remark}" if self.remark else base
         name = self.username or "未知账号"
-        return f"4399账号：{name}"
+        base = f"4399账号：{name}"
+        return f"{base} · {self.remark}" if self.remark else base
 
 
 def load_accounts(path: Path | None = None) -> List[SavedAccount]:
@@ -98,6 +121,8 @@ def load_accounts(path: Path | None = None) -> List[SavedAccount]:
                 cookie_path=item.get("cookie_path", ""),
                 username=item.get("username", ""),
                 password=item.get("password", ""),
+                remark=item.get("remark", ""),
+                sub_mode=item.get("sub_mode", ""),
                 remember_password=bool(item.get("remember_password", False)),
                 last_used=float(item.get("last_used", 0.0)),
             )

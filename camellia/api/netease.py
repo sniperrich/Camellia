@@ -40,7 +40,9 @@ class MPayClient:
         self.game_version = game_version or get_latest_version()
         self._client = HttpClient(
             base_url=MPAY_BASE,
-            default_headers={"User-Agent": DEFAULT_API_USER_AGENT},
+            # Match common launcher behavior: MPay requests are typically sent with
+            # a launcher-like UA containing the game version.
+            default_headers={"User-Agent": f"WPFLauncher/{self.game_version}" or DEFAULT_API_USER_AGENT},
         )
         self._cache_dir = Path.home() / ".camellia" / "mpay"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
@@ -68,7 +70,7 @@ class MPayClient:
         resp = self._client.post_form(path, params)
         data = resp.text()
         if resp.status >= 400:
-            raise NeteaseLoginError(f"email login failed: {data}")
+            raise NeteaseLoginError(_format_mpay_error(resp.status, data, fallback="网易邮箱登录失败"))
         return json.loads(data)
 
     def send_sms_code(self, phone_number: str) -> bool:
@@ -81,9 +83,11 @@ class MPayClient:
             }
         )
         resp = self._client.post_form("/mpay/api/users/login/mobile/get_sms", params)
-        return resp.status < 400
+        if resp.status >= 400:
+            raise NeteaseLoginError(_format_mpay_error(resp.status, resp.text(), fallback="发送验证码失败"))
+        return True
 
-    def verify_sms_code(self, phone_number: str, code: str) -> dict[str, Any] | None:
+    def verify_sms_code(self, phone_number: str, code: str) -> dict[str, Any]:
         device = self.initialize_device()
         params = self._build_base_params()
         params.update(
@@ -95,11 +99,12 @@ class MPayClient:
             }
         )
         resp = self._client.post_form("/mpay/api/users/login/mobile/verify_sms", params)
+        data = resp.text()
         if resp.status >= 400:
-            return None
-        return json.loads(resp.text())
+            raise NeteaseLoginError(_format_mpay_error(resp.status, data, fallback="验证码验证失败"))
+        return json.loads(data)
 
-    def complete_sms_login(self, phone_number: str, ticket: str) -> dict[str, Any] | None:
+    def complete_sms_login(self, phone_number: str, ticket: str) -> dict[str, Any]:
         device = self.initialize_device()
         params = self._build_base_params()
         params.update(
@@ -111,9 +116,10 @@ class MPayClient:
         )
         encoded = _encode_base64(phone_number)
         resp = self._client.post_form(f"/mpay/api/users/login/mobile/finish?un={encoded}", params)
+        data = resp.text()
         if resp.status >= 400:
-            return None
-        return json.loads(resp.text())
+            raise NeteaseLoginError(_format_mpay_error(resp.status, data, fallback="手机号登录失败"))
+        return json.loads(data)
 
     def _encrypt_login_params(self, email: str, password: str, device_key_hex: str) -> str:
         payload = {
@@ -163,7 +169,7 @@ class MPayClient:
         params = self._build_device_registration_params()
         resp = self._client.post_form(f"/mpay/games/{self.project_id}/devices", params)
         if resp.status >= 400:
-            raise NeteaseLoginError(f"device register failed: {resp.text()}")
+            raise NeteaseLoginError(_format_mpay_error(resp.status, resp.text(), fallback="设备注册失败"))
         payload = json.loads(resp.text())
         device = payload.get("device", payload)
         device_id = device.get("id")
@@ -237,20 +243,58 @@ def login_with_netease_phone(phone_number: str, code: str) -> str:
         raise NeteaseLoginError("手机号或验证码不能为空")
     client = MPayClient()
     ticket_wrapper = client.verify_sms_code(phone_number, code)
-    if not ticket_wrapper:
-        raise NeteaseLoginError("验证码验证失败")
     ticket = ticket_wrapper.get("ticket")
     if not ticket:
         raise NeteaseLoginError("验证码无效或已过期")
     user_wrapper = client.complete_sms_login(phone_number, ticket)
-    if not user_wrapper:
-        raise NeteaseLoginError("手机号登录失败")
     user = user_wrapper.get("user") or {}
     user_id = user.get("id")
     token = user.get("token")
     if not user_id or not token:
         raise NeteaseLoginError("手机号登录失败")
     return build_sauth_json(user_id, token, client.device.device_id if client.device else "")
+
+
+def _format_mpay_error(status: int, body: str, *, fallback: str) -> str:
+    """Normalize MPay error payload for UI consumption.
+
+    The GUI tries to parse JSON out of exception strings to show a rich dialog
+    (reason/code/verify_url). Returning a pure JSON string here makes that
+    robust and avoids losing server-provided error details.
+    """
+    text = (body or "").strip()
+    try:
+        payload = json.loads(text) if text.startswith("{") and text.endswith("}") else None
+    except Exception:  # pylint: disable=broad-except
+        payload = None
+
+    if isinstance(payload, dict):
+        reason = payload.get("reason") or payload.get("message") or ""
+        verify_url = payload.get("verify_url") or payload.get("verifyUrl") or ""
+        code = payload.get("code")
+        normalized: dict[str, Any] = {}
+        if reason:
+            normalized["reason"] = reason
+        if isinstance(code, int):
+            normalized["code"] = code
+        if verify_url:
+            normalized["verify_url"] = verify_url
+        if normalized:
+            return json.dumps(normalized, ensure_ascii=False)
+
+    # Non-JSON or unexpected payload: still return JSON for the UI.
+    raw = text
+    if len(raw) > 400:
+        raw = raw[:400] + "..."
+    return json.dumps(
+        {
+            "reason": f"{fallback}（HTTP {status}）",
+            "code": int(status),
+            "verify_url": "",
+            "raw": raw,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _md5_hex(text: str) -> str:

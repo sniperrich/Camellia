@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import traceback
+from datetime import datetime
 from typing import Any, Callable
 
 from PySide6 import QtCore
 
 from ..mc.proxy import MinecraftProxy, ProxyConfig
 
+_LOGGER = logging.getLogger("camellia.proxy.thread")
 
 class WorkerSignals(QtCore.QObject):
     finished = QtCore.Signal(object)
@@ -47,15 +52,39 @@ class ProxyThread(QtCore.QThread):
 
     def run(self) -> None:
         try:
+            if os.name == "nt":
+                # Avoid Proactor quirks in packaged builds by using selector loop policy.
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            _LOGGER.info(
+                "ProxyThread starting on %s:%s -> %s:%s",
+                self._config.listen_host,
+                self._config.listen_port,
+                self._config.forward_host,
+                self._config.forward_port,
+            )
             loop = asyncio.new_event_loop()
             self._loop = loop
             asyncio.set_event_loop(loop)
             self._proxy = MinecraftProxy(self._config)
             loop.run_until_complete(self._proxy.start())
-            self.started_proxy.emit(f"{self._config.listen_host}:{self._config.listen_port}")
+            try:
+                self.started_proxy.emit(f"{self._config.listen_host}:{self._config.listen_port}")
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.warning("ProxyThread started_proxy emit failed: %s", exc)
             loop.run_forever()
         except Exception as exc:  # pylint: disable=broad-except
-            self.error.emit(str(exc))
+            message = str(exc)
+            try:
+                base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "logs"))
+                os.makedirs(base_dir, exist_ok=True)
+                path = os.path.join(base_dir, "proxy_thread_error.log")
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+                    handle.write(traceback.format_exc())
+                    handle.write("\n")
+            except OSError:
+                pass
+            self.error.emit(message)
         finally:
             if self._loop and self._proxy:
                 try:
@@ -64,9 +93,13 @@ class ProxyThread(QtCore.QThread):
                     pass
             if self._loop:
                 self._loop.close()
-            self.stopped_proxy.emit()
+            try:
+                self.stopped_proxy.emit()
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.warning("ProxyThread stopped_proxy emit failed: %s", exc)
 
     def stop(self) -> None:
+        _LOGGER.info("ProxyThread stop requested")
         if not self._loop:
             return
         if self._proxy:

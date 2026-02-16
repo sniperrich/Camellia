@@ -1,0 +1,10 @@
+{
+  "entry": "__init__.py",
+  "meta": {
+    "id": "716925E5-FEEE-8199-5A7A-855D8E6BD85F",
+    "name": "Base1122",
+    "description": "1.12.2 事件/插件消息桥接",
+    "author": "DevCodexus",
+    "version": "1.2.7"
+  }
+}

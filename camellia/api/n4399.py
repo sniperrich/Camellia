@@ -12,6 +12,13 @@ class LoginError(RuntimeError):
     pass
 
 
+_DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
 def _cookie_string(jar: CookieJar) -> str:
     parts = []
     for cookie in jar:
@@ -81,6 +88,8 @@ def _check_login(client: HttpClient, cookie_header: str, rand_time: int) -> Dict
         f"{rand_time}"
     )
     response = client.get(check_url, headers={"Cookie": cookie_header})
+    if response.status >= 400:
+        raise LoginError(f"check login failed: http {response.status}")
     return _parse_query(response.url)
 
 
@@ -104,10 +113,15 @@ def _get_uni_auth(query_params: Dict[str, str], client: HttpClient) -> Dict[str,
         + query_params.get("time", "")
     )
     response = client.get(sdk_url)
+    if response.status >= 400:
+        raise LoginError(f"sdk info failed: http {response.status}")
     text = response.text().strip()
     if text.startswith("(") and text.endswith(")"):
         text = text[1:-1]
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LoginError("sdk info returned invalid json") from exc
     sdk_login_data = data.get("data", {}).get("sdk_login_data", "")
     params = urllib.parse.parse_qs(sdk_login_data, keep_blank_values=True)
     return {k: v[0] for k, v in params.items() if v}
@@ -115,7 +129,14 @@ def _get_uni_auth(query_params: Dict[str, str], client: HttpClient) -> Dict[str,
 
 def login_with_password(username: str, password: str) -> str:
     jar = load_cookie_jar()
-    client = HttpClient(cookie_jar=jar)
+    client = HttpClient(
+        cookie_jar=jar,
+        default_headers={
+            "User-Agent": _DEFAULT_BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
     response = client.post_form(
         "https://ptlogin.4399.com/ptlogin/login.do?v=1",
         _build_login_params(username, password),

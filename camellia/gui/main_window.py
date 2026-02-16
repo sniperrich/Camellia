@@ -6,10 +6,16 @@ Main application window for Camellia.NEL GUI with Material 3 design.
 
 from __future__ import annotations
 
+import json
+import hashlib
+import logging
+import os
 import time
+import traceback
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -21,11 +27,15 @@ from ..api import (
     login_with_netease_phone,
     send_netease_sms,
 )
+from ..api.auth_backend import AuthBackend
 from ..mc import GameProfile, ModList, ProxyConfig, StandardYggdrasil, UserProfile, YggdrasilData, get_md5_pair
 from ..models import AuthOtp, GameCharacter, GameSkin, NetGameDetail, NetGameItem, NetGameServerAddress
 from ..plugins import PluginState, get_plugin_manager
+from ..version import __version__
 from .theme import build_stylesheet
-from .widgets import Backdrop, CamelliaLogo, NavButton, SkinCard, make_nav_icon
+from .widgets import Backdrop, CamelliaLogo, NavButton, SkinCard, make_nav_icon, apply_drop_shadow
+from .dialogs import LoginErrorDialog
+from .auth_gate import AuthGateDialog
 from .storage import SavedAccount, load_accounts, save_accounts
 from .workers import ProxyThread, Worker
 from .pages import LoginPage, ServersPage, CharacterPage, ConnectionPage, SkinPage, PluginsPage, SettingsPage
@@ -43,6 +53,8 @@ class SessionState:
     session_id: str = ""
     client: Optional[WPFLauncherClient] = None
     auth: Optional[AuthOtp] = None
+    display_name: str = ""
+    remark: str = ""
     server: Optional[NetGameItem] = None
     server_detail: Optional[NetGameDetail] = None
     server_address: Optional[NetGameServerAddress] = None
@@ -71,13 +83,18 @@ class SessionState:
         if not self.auth:
             return "未登录"
         channel = self.auth.login_channel or "未知渠道"
-        return f"{channel} / {self.auth.entity_id}"
+        account = self.display_name or self.auth.account or self.auth.entity_id or "未知账号"
+        base = f"{channel} / {account}"
+        if self.remark:
+            return f"{base} · {self.remark}"
+        return base
 
 
 @dataclass
 class ManagedProxy:
     id: int
     user_id: str
+    user_account: str
     user_token: str
     server_id: str
     server_name: str
@@ -101,9 +118,10 @@ class ManagedProxy:
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Camellia NEL 启动器")
+        self.setWindowTitle(f"Camellia NEL 启动器 v{__version__}")
         self.resize(1080, 640)
         self.setMinimumSize(1080, 640)
+        self._logger = logging.getLogger("camellia.gui")
 
         self.thread_pool = QtCore.QThreadPool.globalInstance()
         self._workers: list[Worker] = []
@@ -125,7 +143,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._skin_image_cache: dict[str, QtGui.QPixmap] = {}
         self._skin_image_pending: dict[str, list[SkinCard]] = {}
 
+        # Reuse auth backend session (cookies/headers) to reduce sporadic WAF 403.
+        self._auth_backend: AuthBackend | None = None
+        self._auth_backend_base_url: str = ""
+
         self._build_ui()
+
+    def _get_auth_backend(self, base_url: str) -> AuthBackend:
+        base_url = (base_url or "").strip().rstrip("/")
+        if not base_url:
+            base_url = "https://api.taylorswift.fit"
+        if self._auth_backend is None or self._auth_backend_base_url != base_url:
+            self._auth_backend = AuthBackend(base_url)
+            self._auth_backend_base_url = base_url
+        return self._auth_backend
 
     def _build_ui(self) -> None:
         backdrop = Backdrop()
@@ -148,11 +179,23 @@ class MainWindow(QtWidgets.QMainWindow):
         brand_row.addWidget(title)
         brand_row.addStretch(1)
 
+        sidebar_layout.addLayout(brand_row)
+
+        # Keep version visible without truncating the brand title.
+        subtitle_row = QtWidgets.QHBoxLayout()
         subtitle = QtWidgets.QLabel("Camellia Engine")
         subtitle.setProperty("muted", "true")
-
-        sidebar_layout.addLayout(brand_row)
-        sidebar_layout.addWidget(subtitle)
+        subtitle_row.addWidget(subtitle)
+        subtitle_row.addStretch(1)
+        version_badge = QtWidgets.QLabel(f"v{__version__}")
+        version_badge.setProperty("status", "info")
+        # Keep badge styled via theme rules (rounded corners, background), only tweak font-size.
+        version_badge.setStyleSheet("font-size: 11px;")
+        version_badge.setAlignment(QtCore.Qt.AlignCenter)
+        version_badge.style().unpolish(version_badge)
+        version_badge.style().polish(version_badge)
+        subtitle_row.addWidget(version_badge)
+        sidebar_layout.addLayout(subtitle_row)
 
         self.nav_buttons = {
             "login": NavButton("登录", make_nav_icon("login")),
@@ -211,6 +254,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central_layout.addWidget(self.stack, 1)
 
         self.setCentralWidget(backdrop)
+        self._apply_card_shadows()
 
         self.login_page.login_clicked.connect(lambda: self._handle_login())
         self.login_page.send_sms_clicked.connect(lambda: self._handle_send_sms())
@@ -222,10 +266,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.login_page.saved_list.itemSelectionChanged.connect(lambda: self._load_saved_account())
         self.servers_page.load_more_requested.connect(lambda: self._load_more_servers())
         self.servers_page.server_selected.connect(lambda server: self._handle_server_selected(server))
+        self.servers_page.recent_server_requested.connect(lambda server_id: self._select_recent_server(server_id))
         self.servers_page.continue_requested.connect(lambda: self.switch_page("characters"))
 
         self.characters_page.refresh_requested.connect(lambda: self._load_characters())
-        self.characters_page.create_requested.connect(lambda: self._create_character())
+        self.characters_page.create_requested.connect(lambda name: self._create_character(name))
         self.characters_page.continue_requested.connect(lambda name: self._start_game(name))
 
         self.skins_page.load_more_requested.connect(lambda: self._load_more_skins())
@@ -241,6 +286,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connection_page.proxy_start_requested.connect(lambda host, port: self._start_proxy(host, port))
         self.connection_page.proxy_stop_requested.connect(lambda: self._stop_all_proxies())
         self.connection_page.proxy_close_requested.connect(lambda proxy_id: self._stop_proxy_by_id(proxy_id))
+        self.connection_page.session_switch_requested.connect(lambda sid: self._set_active_session(sid))
+        self.connection_page.proxy_stop_session_requested.connect(lambda sid: self._stop_proxies_for_session(sid))
 
         self.settings_page.theme_changed.connect(lambda theme: self._apply_theme(theme))
         self.settings_page.settings_saved.connect(lambda: self._on_settings_saved())
@@ -249,6 +296,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_nav_icons("login")
         self.switch_page("login")
         self._load_saved_accounts()
+
+    def _dump_sauth(self, mode: str, sauth_json: str) -> None:
+        """Optionally dump sauth_json for debugging purposes.
+
+        sauth_json includes sensitive credentials (sessionid/token). By default we only log a
+        masked preview; enable full dumping via `debug_mode` or `NEL_DUMP_SAUTH=1`.
+        """
+        if not sauth_json:
+            return
+
+        sha = hashlib.sha256(sauth_json.encode("utf-8", errors="replace")).hexdigest()
+        allow_full = bool(self.settings.get("debug_mode", False)) or os.getenv("NEL_DUMP_SAUTH", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        # Always emit a stable fingerprint to help correlate server-side logs.
+        self._logger.info("sauth fingerprint sha256=%s len=%s mode=%s", sha[:16], len(sauth_json), mode)
+
+        try:
+            obj = json.loads(sauth_json)
+        except Exception:  # pylint: disable=broad-except
+            obj = None
+
+        if isinstance(obj, dict):
+            masked = dict(obj)
+            for key in ("sessionid", "gas_token", "userToken", "token"):
+                if key in masked and isinstance(masked[key], str) and masked[key]:
+                    masked[key] = masked[key][:3] + "***" + masked[key][-3:]
+            # Masked preview is safe enough to show at INFO for debugging.
+            self._logger.info("sauth preview=%s", json.dumps(masked, ensure_ascii=False))
+
+        if not allow_full:
+            return
+
+        try:
+            dump_dir = Path.home() / ".camellia" / "dumps"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            path = dump_dir / f"sauth-{ts}-{mode}-{sha[:8]}.json"
+            path.write_text(sauth_json, encoding="utf-8")
+            self._logger.warning("sauth dumped to %s", str(path))
+        except Exception as exc:  # pylint: disable=broad-except
+            self._logger.warning("sauth dump failed: %s", exc)
 
     def switch_page(self, name: str) -> None:
         if name not in self.nav_buttons:
@@ -263,6 +355,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.servers_page.reset_state()
                 self.servers_page.set_status("请先登录以加载服务器列表。")
                 return
+            self._refresh_recent_server_card()
             self._ensure_servers_loaded()
         elif name == "characters":
             if not self.session.client:
@@ -305,6 +398,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, button in self.nav_buttons.items():
             button.setIcon(make_nav_icon(key, active=(key == active)))
 
+    def _apply_card_shadows(self) -> None:
+        for frame in self.findChildren(QtWidgets.QFrame):
+            if frame.property("card") == "true":
+                apply_drop_shadow(frame, color=(0, 0, 0, 30), blur_radius=32, offset=(0, 12))
+
     def _animate_page(self, widget: QtWidgets.QWidget) -> None:
         # Disabled to avoid conflicts with LoadingOverlay
         pass
@@ -333,27 +431,139 @@ class MainWindow(QtWidgets.QMainWindow):
             if worker in self._workers:
                 self._workers.remove(worker)
             worker._callback_proxy = None
+            worker._on_finished = None
+            worker._on_error = None
 
-        class _CallbackProxy(QtCore.QObject):
-            @QtCore.Slot(object)
-            def handle_finished(self, result: object) -> None:
+        def _handle_finished(result: object) -> None:
+            def _invoke() -> None:
                 try:
                     on_success(result)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._logger.exception("Task on_success exception")
+                    on_error(str(exc) or "登录失败。")
                 finally:
                     _cleanup()
+            QtCore.QTimer.singleShot(0, self, _invoke)
 
-            @QtCore.Slot(str)
-            def handle_error(self, message: str) -> None:
+        def _handle_error(message: str) -> None:
+            def _invoke() -> None:
                 try:
                     on_error(message)
                 finally:
                     _cleanup()
+            QtCore.QTimer.singleShot(0, self, _invoke)
 
-        proxy = _CallbackProxy(self)
-        worker._callback_proxy = proxy
-        worker.signals.finished.connect(proxy.handle_finished)
-        worker.signals.error.connect(proxy.handle_error)
+        # Keep references to avoid GC in Nuitka builds.
+        worker._callback_proxy = self
+        worker._on_finished = _handle_finished
+        worker._on_error = _handle_error
+        worker.signals.finished.connect(_handle_finished)
+        worker.signals.error.connect(_handle_error)
         self.thread_pool.start(worker)
+
+    def _login_status(self, message: str, *, error: bool = False) -> None:
+        self.login_page.set_status(message, error=error)
+
+    def _proxy_status(self, message: str, *, error: bool = False) -> None:
+        self.connection_page.set_proxy_status(message, error=error)
+
+    def _store_auth_tokens(self, username: str, access_token: str, refresh_token: str) -> None:
+        self._logger.info(
+            "Auth store tokens user=%s access_len=%s refresh_len=%s",
+            username,
+            len(access_token),
+            len(refresh_token),
+        )
+        if username:
+            self.settings.set("auth_user", username)
+        if access_token:
+            self.settings.set("auth_access_token", access_token)
+        if refresh_token:
+            self.settings.set("auth_refresh_token", refresh_token)
+
+    def _open_auth_gate(self, status_cb: callable | None, proceed: callable) -> None:
+        self._logger.info("Auth gate open")
+        gate = AuthGateDialog(self)
+        if gate.exec() == QtWidgets.QDialog.Accepted:
+            self._logger.info("Auth gate accepted")
+            if status_cb:
+                status_cb("")
+            proceed()
+        else:
+            self._logger.info("Auth gate rejected")
+            if status_cb:
+                status_cb("授权未完成，已取消。", error=True)
+
+    def _ensure_auth_then(self, reason: str, proceed: callable, status_cb: callable | None = None) -> None:
+        access = self.settings.get("auth_access_token", "")
+        refresh = self.settings.get("auth_refresh_token", "")
+        base_url = self.settings.get("auth_base_url", "https://api.taylorswift.fit")
+        device_id = self.settings.get("auth_device_id", "")
+        self._logger.info("Auth ensure reason=%s access=%s refresh=%s", reason, bool(access), bool(refresh))
+
+        if not access and not refresh:
+            if status_cb:
+                status_cb(f"需要授权才能{reason}。", error=True)
+            self._open_auth_gate(status_cb, proceed)
+            return
+
+        if status_cb:
+            status_cb("正在验证授权…")
+
+        def task() -> tuple[str, dict]:
+            backend = self._get_auth_backend(base_url)
+            verify_resp: dict = {}
+            if access:
+                self._logger.info("Auth verify access token")
+                verify_resp = backend.verify(access)
+                if verify_resp.get("success"):
+                    return "ok", verify_resp
+            if refresh:
+                self._logger.info("Auth refresh token")
+                refresh_resp = backend.refresh(refresh, device_id)
+                if refresh_resp.get("success"):
+                    new_access = refresh_resp.get("access_token", "")
+                    self._logger.info("Auth refresh ok access_len=%s", len(new_access))
+                    verify_new = backend.verify(new_access) if new_access else {}
+                    if verify_new.get("success"):
+                        return "refresh_ok", {
+                            "refresh": refresh_resp,
+                            "verify": verify_new,
+                        }
+                return "refresh_fail", refresh_resp
+            return "fail", verify_resp
+
+        def on_success(result: tuple[str, dict]) -> None:
+            kind, payload = result
+            self._logger.info("Auth ensure result=%s", kind)
+            if kind == "ok":
+                if status_cb:
+                    status_cb("")
+                proceed()
+                return
+            if kind == "refresh_ok":
+                refresh_resp = payload.get("refresh", {})
+                verify_resp = payload.get("verify", {})
+                self._store_auth_tokens(
+                    verify_resp.get("user", "") if isinstance(verify_resp, dict) else "",
+                    refresh_resp.get("access_token", ""),
+                    refresh_resp.get("refresh_token", ""),
+                )
+                if status_cb:
+                    status_cb("")
+                proceed()
+                return
+            if status_cb:
+                status_cb("授权已失效，请重新登录。", error=True)
+            self._open_auth_gate(status_cb, proceed)
+
+        def on_error(message: str) -> None:
+            self._logger.warning("Auth ensure error=%s", message)
+            if status_cb:
+                status_cb(message or "授权验证失败，请重新登录。", error=True)
+            self._open_auth_gate(status_cb, proceed)
+
+        self._run_task(task, on_success, on_error)
 
     def _refresh_proxy_manager(self) -> None:
         self.connection_page.set_proxies(self._managed_proxies)
@@ -443,6 +653,23 @@ class MainWindow(QtWidgets.QMainWindow):
         for proxy in list(self._managed_proxies):
             self._stop_proxy_thread(proxy)
 
+    def _stop_proxies_for_session(self, session_id: str) -> None:
+        session = self._sessions.get(session_id)
+        if not session or not session.auth:
+            self.connection_page.set_proxy_manager_status("请选择有效账号。", error=True)
+            return
+        user_id = session.auth.entity_id
+        stopped = False
+        for proxy in list(self._managed_proxies):
+            if proxy.user_id == user_id:
+                stopped = True
+                self._stop_proxy_thread(proxy)
+        if stopped:
+            label = session.display_label()
+            self.connection_page.set_proxy_manager_status(f"已请求关闭 {label} 的代理。")
+        else:
+            self.connection_page.set_proxy_manager_status("该账号暂无运行中的代理。")
+
     def _cleanup_duplicate_proxies(self, user_id: str, server_id: str, nickname: str, user_token: str) -> None:
         for proxy in list(self._managed_proxies):
             same_user = proxy.user_id == user_id
@@ -458,41 +685,41 @@ class MainWindow(QtWidgets.QMainWindow):
                 return proxy
         return None
 
-    @QtCore.Slot(str)
-    def _on_proxy_started(self, address: str) -> None:
-        thread = self.sender()
+    def _on_proxy_started(self, address: str, thread: ProxyThread | None = None) -> None:
+        thread = thread or self.sender()
         if not isinstance(thread, ProxyThread):
             return
         proxy = self._find_proxy_by_thread(thread)
         if not proxy:
             return
+        self._logger.info("Proxy started id=%s address=%s", proxy.id, address)
         proxy.status = "运行中"
         self.connection_page.set_proxy_status(
             f"代理已启动：{address} -> {proxy.forward_host}:{proxy.forward_port}"
         )
         self._refresh_proxy_manager()
 
-    @QtCore.Slot(str)
-    def _on_proxy_error(self, message: str) -> None:
-        thread = self.sender()
+    def _on_proxy_error(self, message: str, thread: ProxyThread | None = None) -> None:
+        thread = thread or self.sender()
         if not isinstance(thread, ProxyThread):
             return
         proxy = self._find_proxy_by_thread(thread)
         if not proxy:
             return
+        self._logger.warning("Proxy error id=%s message=%s", proxy.id, message)
         proxy.status = "启动失败"
         self.connection_page.set_proxy_status(message or "代理启动失败。", error=True)
         self.connection_page.set_proxy_manager_status(f"代理 #{proxy.id} 启动失败。", error=True)
         self._refresh_proxy_manager()
 
-    @QtCore.Slot()
-    def _on_proxy_stopped(self) -> None:
-        thread = self.sender()
+    def _on_proxy_stopped(self, thread: ProxyThread | None = None) -> None:
+        thread = thread or self.sender()
         if not isinstance(thread, ProxyThread):
             return
         proxy = self._find_proxy_by_thread(thread)
         if not proxy:
             return
+        self._logger.info("Proxy stopped id=%s", proxy.id)
         self._remove_proxy(proxy)
         if not self._managed_proxies:
             self.connection_page.set_proxy_status("代理已停止。")
@@ -507,6 +734,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_sessions(self) -> None:
         sessions = list(self._sessions.values())
         self.login_page.set_sessions(sessions, selected_id=self._active_session_id)
+        self.connection_page.set_sessions(sessions, selected_id=self._active_session_id)
 
     def _set_active_session(self, session_id: str | None) -> None:
         if not session_id or session_id not in self._sessions:
@@ -584,7 +812,17 @@ class MainWindow(QtWidgets.QMainWindow):
         elif account.mode == "netease_phone":
             self.login_page.select_account_type(2)
             self.login_page.netease_phone.setText(account.username)
-            self.login_page.netease_code.setText("")
+            phone_sub_mode = getattr(account, "sub_mode", "") or ("password" if getattr(account, "password", "") else "sms")
+            if phone_sub_mode == "password":
+                self.login_page.set_netease_phone_login_mode("password")
+                self.login_page.netease_phone_pass.setText(account.password)
+                self.login_page.netease_code.setText("")
+            else:
+                self.login_page.set_netease_phone_login_mode("sms")
+                self.login_page.netease_phone_pass.setText("")
+                self.login_page.netease_code.setText("")
+        # Keep remark in sync for all modes.
+        self.login_page.remark_input.setText(getattr(account, "remark", "") or "")
 
     def _handle_saved_login(self) -> None:
         account = self._current_saved_account()
@@ -597,26 +835,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_current_account(self) -> None:
         mode = self.login_page.login_mode()
         remember = self._should_remember_password()
+        remark = self.login_page.remark_input.text().strip()
         if mode == "account":
             username = self.login_page.account_user.text().strip()
             if not username:
                 self.login_page.set_status("请输入用户名。", error=True)
                 return
             password = self.login_page.account_pass.text().strip()
-            account = SavedAccount.new_account(username, password, remember)
+            account = SavedAccount.new_account(username, password, remember, remark=remark)
         elif mode == "netease_email":
             email = self.login_page.netease_email.text().strip()
             if not email:
                 self.login_page.set_status("请输入网易邮箱。", error=True)
                 return
             password = self.login_page.netease_pass.text().strip()
-            account = SavedAccount.new_netease_email(email, password, remember)
+            account = SavedAccount.new_netease_email(email, password, remember, remark=remark)
         else:
             phone = self.login_page.netease_phone.text().strip()
             if not phone:
                 self.login_page.set_status("请输入手机号。", error=True)
                 return
-            account = SavedAccount.new_netease_phone(phone)
+            phone_mode = self.login_page.netease_phone_login_mode()
+            if phone_mode == "password":
+                password = self.login_page.netease_phone_pass.text().strip()
+                if not password:
+                    self.login_page.set_status("请输入密码。", error=True)
+                    return
+                account = SavedAccount.new_netease_phone(
+                    phone, login_mode="password", password=password, remember=remember, remark=remark
+                )
+            else:
+                account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
 
         for idx, existing in enumerate(self._saved_accounts):
             if existing.mode == account.mode and existing.key == account.key:
@@ -640,6 +889,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _auto_save_account(self, mode: str) -> None:
         remember = self._should_remember_password()
+        remark = self.login_page.remark_input.text().strip()
         if mode == "account":
             username = self.login_page.account_user.text().strip()
             if not username:
@@ -649,6 +899,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if existing:
                 existing.username = username
                 existing.last_used = time.time()
+                if remark:
+                    existing.remark = remark
                 if remember:
                     existing.password = password
                     existing.remember_password = True
@@ -658,7 +910,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
-            account = SavedAccount.new_account(username, password, remember)
+            account = SavedAccount.new_account(username, password, remember, remark=remark)
         elif mode == "netease_email":
             email = self.login_page.netease_email.text().strip()
             if not email:
@@ -668,6 +920,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if existing:
                 existing.username = email
                 existing.last_used = time.time()
+                if remark:
+                    existing.remark = remark
                 if remember:
                     existing.password = password
                     existing.remember_password = True
@@ -677,19 +931,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
-            account = SavedAccount.new_netease_email(email, password, remember)
+            account = SavedAccount.new_netease_email(email, password, remember, remark=remark)
         else:
             phone = self.login_page.netease_phone.text().strip()
             if not phone:
                 return
+            phone_mode = self.login_page.netease_phone_login_mode()
+            password = self.login_page.netease_phone_pass.text().strip() if (remember and phone_mode == "password") else ""
             existing = next((item for item in self._saved_accounts if item.mode == "netease_phone" and item.key == phone), None)
             if existing:
                 existing.username = phone
                 existing.last_used = time.time()
+                if remark:
+                    existing.remark = remark
+                if phone_mode == "password":
+                    existing.sub_mode = "password"
+                    if remember and password:
+                        existing.password = password
+                        existing.remember_password = True
+                    else:
+                        existing.password = ""
+                        existing.remember_password = False
+                else:
+                    existing.sub_mode = "sms"
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
-            account = SavedAccount.new_netease_phone(phone)
+            if phone_mode == "password":
+                account = SavedAccount.new_netease_phone(
+                    phone, login_mode="password", password=password, remember=remember, remark=remark
+                )
+            else:
+                account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
 
         self._saved_accounts.append(account)
         save_accounts(self._saved_accounts)
@@ -699,43 +972,73 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(self.settings.get("remember_password", True))
 
     def _handle_login(self) -> None:
+        def proceed() -> None:
+            self._handle_login_impl()
+
+        self._ensure_auth_then(
+            reason="登录账号",
+            proceed=proceed,
+            status_cb=self._login_status,
+        )
+
+    def _handle_login_impl(self) -> None:
         self.login_page.clear_status()
         self.login_page.set_busy(True)
 
         mode = self.login_page.login_mode()
+        display_name = ""
+        remark = self.login_page.remark_input.text().strip()
         if mode == "account":
             username = self.login_page.account_user.text().strip()
             password = self.login_page.account_pass.text().strip()
+            display_name = username
 
             def task() -> tuple[WPFLauncherClient, AuthOtp]:
                 if not username or not password:
                     raise ValueError("请输入用户名和密码")
                 client = WPFLauncherClient()
                 sauth_json = login_with_password(username, password)
+                self._dump_sauth(mode, sauth_json)
                 auth = client.login_with_cookie(sauth_json)
                 return client, auth
 
         elif mode == "netease_email":
             email = self.login_page.netease_email.text().strip()
             password = self.login_page.netease_pass.text().strip()
+            display_name = email
 
             def task() -> tuple[WPFLauncherClient, AuthOtp]:
                 if not email or not password:
                     raise ValueError("请输入邮箱和密码")
                 client = WPFLauncherClient()
                 sauth_json = login_with_netease_email(email, password)
+                self._dump_sauth(mode, sauth_json)
                 auth = client.login_with_cookie(sauth_json)
                 return client, auth
 
         else:
             phone = self.login_page.netease_phone.text().strip()
-            code = self.login_page.netease_code.text().strip()
+            display_name = phone
+            phone_mode = self.login_page.netease_phone_login_mode()
 
             def task() -> tuple[WPFLauncherClient, AuthOtp]:
-                if not phone or not code:
-                    raise ValueError("请输入手机号和验证码")
+                if not phone:
+                    raise ValueError("请输入手机号")
                 client = WPFLauncherClient()
+                if phone_mode == "password":
+                    password = self.login_page.netease_phone_pass.text().strip()
+                    if not password:
+                        raise ValueError("请输入密码")
+                    email = f"{phone}@163.com"
+                    sauth_json = login_with_netease_email(email, password)
+                    self._dump_sauth(f"{mode}:{phone_mode}", sauth_json)
+                    auth = client.login_with_cookie(sauth_json)
+                    return client, auth
+                code = self.login_page.netease_code.text().strip()
+                if not code:
+                    raise ValueError("请输入验证码")
                 sauth_json = login_with_netease_phone(phone, code)
+                self._dump_sauth(f"{mode}:{phone_mode}", sauth_json)
                 auth = client.login_with_cookie(sauth_json)
                 return client, auth
 
@@ -746,9 +1049,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 session_id=session_id,
                 client=client,
                 auth=auth,
+                display_name=display_name or auth.account or auth.entity_id,
+                remark=remark,
             )
             self._set_active_session(session_id)
-            print(f"user_token={auth.token}")
+            token_preview = auth.token[:4] + "..." if auth.token else ""
+            self._logger.debug("user_token=%s", token_preview)
             self._server_offset = 0
             self.servers_page.reset_state()
             self._skin_offset = 0
@@ -764,30 +1070,115 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def on_error(message: str) -> None:
             self.login_page.set_busy(False)
-            self.login_page.set_status(message or "登录失败。", error=True)
+            if self._show_login_error(message):
+                self.login_page.set_status("登录失败，请查看详细提示。", error=True)
+            else:
+                self.login_page.set_status(message or "登录失败。", error=True)
 
         self._run_task(task, on_success, on_error)
 
     def _handle_send_sms(self) -> None:
-        phone = self.login_page.netease_phone.text().strip()
-        if not phone:
-            self.login_page.set_status("请输入手机号。", error=True)
-            return
-        self.login_page.set_busy(True)
+        def proceed() -> None:
+            phone = self.login_page.netease_phone.text().strip()
+            if not phone:
+                self.login_page.set_status("请输入手机号。", error=True)
+                return
+            self.login_page.set_busy(True)
 
-        def task() -> bool:
-            return send_netease_sms(phone)
+            def task() -> bool:
+                return send_netease_sms(phone)
 
-        def on_success(ok: bool) -> None:
-            self.login_page.set_busy(False)
-            if ok:
-                self.login_page.set_status("验证码已发送，请查收短信。")
-            else:
-                self.login_page.set_status("验证码发送失败。", error=True)
+            def on_success(ok: bool) -> None:
+                self.login_page.set_busy(False)
+                if ok:
+                    self.login_page.set_status("验证码已发送，请查收短信。")
+                else:
+                    self.login_page.set_status("验证码发送失败。", error=True)
 
-        def on_error(message: str) -> None:
-            self.login_page.set_busy(False)
-            self.login_page.set_status(message or "验证码发送失败。", error=True)
+            def on_error(message: str) -> None:
+                self.login_page.set_busy(False)
+                if self._show_login_error(message, title="发送验证码失败"):
+                    self.login_page.set_status("验证码发送失败，请查看详细提示。", error=True)
+                else:
+                    self.login_page.set_status(message or "验证码发送失败。", error=True)
+
+            self._run_task(task, on_success, on_error)
+
+        self._ensure_auth_then(
+            reason="发送验证码",
+            proceed=proceed,
+            status_cb=self._login_status,
+        )
+
+    def _show_login_error(self, message: str | None, *, title: str = "网易账号登录失败") -> bool:
+        if not message:
+            return False
+        normalized = message.lower()
+        net_map = [
+            ("connection reset by peer", "网络连接被服务器断开，可能是网络波动或临时风控，请稍后重试。"),
+            ("winerror 10054", "网络连接被对端强制断开（10054）。常见原因是系统代理/VPN/拦截导致 SSL 或连接被重置，请先关闭系统代理/VPN 后重试。"),
+            ("errno 10054", "网络连接被对端强制断开（10054）。常见原因是系统代理/VPN/拦截导致 SSL 或连接被重置，请先关闭系统代理/VPN 后重试。"),
+            ("winerror 10049", "当前网络地址不可用（10049）。常见原因是系统代理/VPN 配置指向了不可用地址或网络环境异常，请先关闭系统代理/VPN 后重试。"),
+            ("errno 10049", "当前网络地址不可用（10049）。常见原因是系统代理/VPN 配置指向了不可用地址或网络环境异常，请先关闭系统代理/VPN 后重试。"),
+            ("timed out", "网络请求超时，请检查网络或稍后重试。"),
+            ("name or service not known", "域名解析失败，请检查网络或 DNS 设置。"),
+            ("temporary failure in name resolution", "DNS 解析失败，请检查网络或稍后重试。"),
+            ("connection refused", "目标服务器拒绝连接，请稍后重试。"),
+            ("ssl: certificate_verify_failed", "SSL 证书校验失败，请检查系统时间或网络环境。"),
+            ("http error 400", "请求被拒绝（400）。可能是账号需要安全验证或参数被服务器拒绝。"),
+            ("http error 403", "请求被拒绝（403）。可能触发风控或权限不足。"),
+            ("http error 429", "请求过于频繁（429），请稍后再试。"),
+            ("http error 500", "服务器内部错误（500），请稍后重试。"),
+            ("http error 502", "服务器网关错误（502），请稍后重试。"),
+            ("http error 503", "服务器暂时不可用（503），请稍后重试。"),
+            ("http error 504", "服务器网关超时（504），请稍后重试。"),
+        ]
+        for key, friendly in net_map:
+            if key in normalized:
+                dialog = LoginErrorDialog(
+                    title=title,
+                    reason=friendly,
+                    parent=self,
+                )
+                dialog.exec()
+                return True
+        start = message.find("{")
+        end = message.rfind("}")
+        if start == -1 or end <= start:
+            return False
+        payload_text = message[start:end + 1]
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return False
+
+        reason = payload.get("reason") or payload.get("message") or ""
+        verify_url = payload.get("verify_url") or payload.get("verifyUrl") or ""
+        code = payload.get("code")
+        details = payload.get("raw") if isinstance(payload, dict) else None
+        if isinstance(details, str) and not details.strip():
+            details = None
+        if not reason and not verify_url and code is None:
+            return False
+
+        dialog_title = title
+        final_reason = reason or "登录失败，请稍后再试。"
+        # Provide extra guidance for MPay security verification flows.
+        if (code == 1351 or verify_url) and "安全验证" not in final_reason:
+            final_reason = final_reason.rstrip("。") + "。"
+        if code == 1351 or verify_url:
+            final_reason += "\n请在浏览器打开/复制下方链接完成安全验证后，再回到 Camellia 重新登录。"
+
+        dialog = LoginErrorDialog(
+            title=dialog_title,
+            reason=final_reason,
+            code=code if isinstance(code, int) else None,
+            verify_url=verify_url or None,
+            details=details if isinstance(details, str) else None,
+            parent=self,
+        )
+        dialog.exec()
+        return True
 
         self._run_task(task, on_success, on_error)
 
@@ -1041,6 +1432,16 @@ class MainWindow(QtWidgets.QMainWindow):
         def on_success(_: object) -> None:
             self.session.character_name = character_name
             self.session.game_started = True
+            # Store last played server info
+            if self.session.server:
+                version = self.session.server_version() or "--"
+                host, port = self.session.remote_address()
+                address = _format_address(host, port) if host and port else "--"
+                self.settings.set("last_server_id", self.session.server.entity_id, save=False)
+                self.settings.set("last_server_name", self.session.server.name or "服务器", save=False)
+                self.settings.set("last_server_version", version, save=False)
+                self.settings.set("last_server_address", address, save=False)
+                self.settings.set("last_server_time", int(time.time()), save=True)
             self.characters_page.set_status("进入游戏成功。")
             self._set_nav_enabled(servers=True, characters=True, connection=True, skins=True, plugins=True)
             self.switch_page("connection")
@@ -1065,6 +1466,34 @@ class MainWindow(QtWidgets.QMainWindow):
             can_proxy=bool(self.session.character_name),
         )
 
+    def _refresh_recent_server_card(self) -> None:
+        last_id = self.settings.get("last_server_id", "")
+        if not last_id:
+            self.servers_page.set_recent_server(None)
+            return
+        info = {
+            "id": last_id,
+            "name": self.settings.get("last_server_name", ""),
+            "version": self.settings.get("last_server_version", ""),
+            "address": self.settings.get("last_server_address", ""),
+            "time": self.settings.get("last_server_time", 0),
+        }
+        self.servers_page.set_recent_server(info)
+
+    def _select_recent_server(self, server_id: str) -> None:
+        if not server_id or not self.session.client:
+            return
+        server = self.servers_page.find_server_by_id(server_id)
+        if server is None:
+            server = NetGameItem(
+                entity_id=server_id,
+                name=self.settings.get("last_server_name", "服务器"),
+                brief_summary="",
+                online_count="--",
+                title_image_url="",
+            )
+        self._handle_server_selected(server)
+
     def _build_ygg_profile(self, include_mods: bool) -> tuple[GameProfile, YggdrasilData]:
         if not self.session.client or not self.session.server or not self.session.auth:
             raise RuntimeError("缺少会话数据")
@@ -1073,17 +1502,36 @@ class MainWindow(QtWidgets.QMainWindow):
         if not version:
             raise RuntimeError("服务器版本不可用")
 
+        t0 = time.perf_counter()
+        self._logger.info(
+            "ProxyPhase ygg profile start game_id=%s version=%s include_mods=%s",
+            self.session.server.entity_id,
+            version,
+            include_mods,
+        )
+
+        t1 = time.perf_counter()
         info = self.session.client.fetch_fantnel_info()
+        self._logger.info("ProxyPhase ygg fetch fantnel info %.1fms", (time.perf_counter() - t1) * 1000)
         if not info.crc_salt:
             raise RuntimeError("CRC 盐值不可用")
 
+        t2 = time.perf_counter()
         pair = get_md5_pair(version)
+        self._logger.info("ProxyPhase ygg md5 pair %.1fms", (time.perf_counter() - t2) * 1000)
         mods = ModList([])
         if include_mods:
             try:
+                t3 = time.perf_counter()
                 mods = self.session.client.get_mod_list(self.session.server.entity_id, version, include_assets=True)
+                self._logger.info(
+                    "ProxyPhase ygg mod list %s %.1fms",
+                    len(mods.mods),
+                    (time.perf_counter() - t3) * 1000,
+                )
             except Exception:  # pylint: disable=broad-except
                 mods = ModList([])
+                self._logger.warning("ProxyPhase ygg mod list failed, fallback empty")
 
         profile = GameProfile(
             game_id=self.session.server.entity_id,
@@ -1098,6 +1546,7 @@ class MainWindow(QtWidgets.QMainWindow):
             channel="netease",
             crc_salt=info.crc_salt,
         )
+        self._logger.info("ProxyPhase ygg profile ready %.1fms", (time.perf_counter() - t0) * 1000)
         return profile, ygg_data
 
     def _join_yggdrasil(self, server_id: str) -> None:
@@ -1126,6 +1575,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_task(task, on_success, on_error)
 
     def _start_proxy(self, local_host: str, local_port_raw: str) -> None:
+        def proceed() -> None:
+            self._start_proxy_impl(local_host, local_port_raw)
+
+        self._ensure_auth_then(
+            reason="启动代理",
+            proceed=proceed,
+            status_cb=self._proxy_status,
+        )
+
+    def _start_proxy_impl(self, local_host: str, local_port_raw: str) -> None:
         if not self.session.server or not self.session.character_name:
             self.connection_page.set_proxy_status("请先选择服务器和角色。", error=True)
             return
@@ -1141,6 +1600,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.connection_page.set_proxy_status("本地端口无效。", error=True)
             return
 
+        self._logger.info("Proxy start requested host=%s port=%s", local_host, local_port_raw)
         self.connection_page.set_proxy_status("正在准备代理配置...")
         self.connection_page.proxy_start_button.setEnabled(False)
 
@@ -1168,10 +1628,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 ygg_profile=profile,
                 ygg_data=ygg_data,
             )
+            self._logger.info(
+                "Proxy config ready listen=%s:%s forward=%s:%s",
+                config.listen_host,
+                config.listen_port,
+                config.forward_host,
+                config.forward_port,
+            )
             self._launch_proxy_thread(config)
             self.connection_page.proxy_start_button.setEnabled(True)
 
         def on_error(message: str) -> None:
+            self._logger.warning("Proxy config error: %s", message)
             self.connection_page.set_proxy_status(message or "准备代理失败。", error=True)
             self.connection_page.proxy_start_button.setEnabled(True)
 
@@ -1184,6 +1652,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         user_id = self.session.auth.entity_id
+        user_account = self.session.display_name or self.session.auth.account or self.session.auth.entity_id
+        if getattr(self.session, "remark", ""):
+            user_account = f"{user_account} · {self.session.remark}"
         user_token = self.session.auth.token
         server_id = self.session.server.entity_id
         server_name = self.session.server.name or "服务器"
@@ -1204,6 +1675,7 @@ class MainWindow(QtWidgets.QMainWindow):
         proxy = ManagedProxy(
             id=self._next_proxy_id,
             user_id=user_id,
+            user_account=user_account,
             user_token=user_token,
             server_id=server_id,
             server_name=server_name,
@@ -1221,10 +1693,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._managed_proxies.append(proxy)
         self._refresh_proxy_manager()
         self.connection_page.set_proxy_status("正在启动代理...")
+        self._logger.info(
+            "Proxy thread launch id=%s local=%s forward=%s",
+            proxy.id,
+            proxy.local_address(),
+            proxy.forward_address(),
+        )
 
-        thread.started_proxy.connect(self._on_proxy_started)
-        thread.error.connect(self._on_proxy_error)
-        thread.stopped_proxy.connect(self._on_proxy_stopped)
+        thread.started_proxy.connect(lambda address, t=thread: self._on_proxy_started(address, t))
+        thread.error.connect(lambda message, t=thread: self._on_proxy_error(message, t))
+        thread.stopped_proxy.connect(lambda t=thread: self._on_proxy_stopped(t))
         thread.start()
 
     def _apply_theme(self, theme: str) -> None:

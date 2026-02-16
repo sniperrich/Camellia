@@ -1,5 +1,7 @@
 """Theme helpers for the Qt GUI with Material 3 support."""
 
+import base64
+
 # Material 3 Light Theme Palette
 LIGHT_PALETTE = {
     "bg": "#eef1f0",
@@ -12,12 +14,17 @@ LIGHT_PALETTE = {
     "text": "#1C1B1F",
     "text_secondary": "#49454F",
     "muted": "#5e6f6b",
-    "border": "#d7e0dd",
+    "border": "#c4cdc9",
+    "border_strong": "#9aa5a0",
     "danger": "#BA1A1A",
     "warning": "#7D5700",
     "success": "#2E7D32",
     "surface": "#FEF7FF",
     "surface_variant": "#E7E0EC",
+    "glass": "rgba(255, 255, 255, 0.72)",
+    "glass_alt": "rgba(255, 255, 255, 0.62)",
+    "glass_border": "rgba(255, 255, 255, 0.45)",
+    "glass_hover": "rgba(255, 255, 255, 0.82)",
 }
 
 # Material 3 Dark Theme Palette
@@ -33,11 +40,16 @@ DARK_PALETTE = {
     "text_secondary": "#CAC4D0",
     "muted": "#938F99",
     "border": "#49454F",
+    "border_strong": "#635e6a",
     "danger": "#FFB4AB",
     "warning": "#FFB951",
     "success": "#81C784",
     "surface": "#1C1B1F",
     "surface_variant": "#49454F",
+    "glass": "rgba(42, 39, 47, 0.68)",
+    "glass_alt": "rgba(42, 39, 47, 0.58)",
+    "glass_border": "rgba(255, 255, 255, 0.12)",
+    "glass_hover": "rgba(58, 54, 64, 0.75)",
 }
 
 # Default palette (for backward compatibility)
@@ -75,6 +87,14 @@ def build_stylesheet(theme: str = "light") -> str:
         Complete stylesheet string
     """
     colors = get_palette(theme)
+    arrow_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' "
+        f"fill='{colors['text_secondary']}'>"
+        "<path d='M7 10l5 5 5-5z'/>"
+        "</svg>"
+    )
+    arrow_b64 = base64.b64encode(arrow_svg.encode("utf-8")).decode("ascii")
+    arrow_uri = f"data:image/svg+xml;base64,{arrow_b64}"
     return f"""
     * {{
         color: {colors["text"]};
@@ -87,12 +107,12 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     #Sidebar {{
-        background: rgba(255, 255, 255, 0.92);
+        background: {colors["glass"]};
         border-right: 1px solid {colors["border"]};
     }}
 
     #ContentStack {{
-        background: rgba(255, 255, 255, 0.85);
+        background: transparent;
         border-left: none;
     }}
 
@@ -133,44 +153,56 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     QComboBox {{
-        background: {colors["panel"]};
+        background: {colors["surface_variant"]};
         border: 1px solid {colors["border"]};
-        border-radius: 10px;
-        padding: 6px 10px;
-        min-width: 110px;
+        border-radius: 12px;
+        padding: 8px 12px;
+        min-width: 100px;
+        min-height: 25px;
     }}
-    
+
     QComboBox:hover {{
-        border: 1px solid {colors["accent"]};
+        border: 1px solid {colors["accent_dark"]};
+        background: {colors["panel_alt"]};
     }}
-    
+
+    QComboBox:focus {{
+        border: 2px solid {colors["accent"]};
+        background: {colors["panel_alt"]};
+    }}
+
     QComboBox::drop-down {{
-        border: none;
-        width: 20px;
+        border-left: 1px solid {colors["border"]};
+        width: 30px;
+        border-top-right-radius: 12px;
+        border-bottom-right-radius: 12px;
+        background: {colors["panel_alt"]};
     }}
-    
+
+    QComboBox::drop-down:hover {{
+        background: {colors["surface_variant"]};
+    }}
+
     QComboBox::down-arrow {{
-        image: none;
-        border-left: 4px solid transparent;
-        border-right: 4px solid transparent;
-        border-top: 6px solid {colors["text"]};
-        width: 0;
-        height: 0;
-        margin-right: 8px;
+        width: 12px;
+        height: 12px;
+        image: url("{arrow_uri}");
     }}
 
     QAbstractItemView {{
         background: {colors["panel"]};
         border: 1px solid {colors["border"]};
-        border-radius: 8px;
-        selection-background-color: {colors["accent"]};
-        selection-color: white;
+        border-radius: 12px;
+        selection-background-color: {colors["accent_light"]};
+        selection-color: {colors["text"]};
         outline: 0;
+        padding: 4px;
     }}
 
     QComboBox QAbstractItemView {{
-        padding: 4px;
+        padding: 6px;
     }}
+
 
     QListWidget {{
         background: {colors["panel"]};
@@ -196,6 +228,34 @@ def build_stylesheet(theme: str = "light") -> str:
         padding: 8px 10px;
     }}
 
+    QCheckBox {{
+        spacing: 8px;
+    }}
+
+    QCheckBox::indicator {{
+        width: 16px;
+        height: 16px;
+        border: 1px solid {colors["border_strong"]};
+        border-radius: 4px;
+        background-color: {colors["panel"]};
+    }}
+
+    QCheckBox::indicator:hover {{
+        border: 1px solid {colors["accent"]};
+    }}
+
+    QCheckBox::indicator:checked {{
+        background-color: {colors["accent"]};
+        border: 1px solid {colors["accent"]};
+        image: url(:/qt-project.org/styles/commonstyle/images/checkbox_checked.png);
+    }}
+
+    QCheckBox::indicator:checked:disabled {{
+        background-color: {colors["border"]};
+        border: 1px solid {colors["border"]};
+        image: url(:/qt-project.org/styles/commonstyle/images/checkbox_checked_disabled.png);
+    }}
+
     QScrollArea {{
         background: transparent;
         border: none;
@@ -219,13 +279,19 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     QPushButton {{
-        background: {colors["panel"]};
-        border: 1px solid {colors["border"]};
+        background-color: {colors["panel"]};
+        border: 1px solid {colors["border_strong"]};
+        border-style: solid;
+        border-image: none;
         border-radius: 12px;
         padding: 5px 10px;
         font-weight: 500;
         font-size: 14px;
         min-height: 28px;
+    }}
+
+    QPushButton:focus {{
+        outline: none;
     }}
 
     QPushButton:hover {{
@@ -238,9 +304,10 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     QPushButton[variant="primary"] {{
-        background: {colors["accent"]};
+        background-color: {colors["accent"]};
         color: white;
         border: none;
+        border-image: none;
         border-radius: 12px;
         padding: 6px 12px;
         font-weight: 600;
@@ -257,8 +324,10 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     QPushButton[variant="ghost"] {{
-        background: transparent;
-        border: 1px solid {colors["border"]};
+        background-color: transparent;
+        border: 1px solid {colors["border_strong"]};
+        border-style: solid;
+        border-image: none;
         border-radius: 12px;
         padding: 5px 10px;
         font-weight: 500;
@@ -276,7 +345,7 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     QPushButton[variant="danger"] {{
-        background: {colors["danger"]};
+        background-color: {colors["danger"]};
         color: white;
         border: none;
         font-weight: 600;
@@ -336,22 +405,33 @@ def build_stylesheet(theme: str = "light") -> str:
     }}
 
     QFrame[card="true"] {{
+        background: {colors["glass"]};
+        border: 1px solid {colors["glass_border"]};
+        border-radius: 14px;
+    }}
+
+    QFrame[auth_card="true"] {{
+        border-radius: 0px;
+        border: none;
         background: {colors["panel"]};
-        border: 1px solid {colors["border"]};
-        border-radius: 12px;
     }}
 
     QFrame[card="true"]:hover {{
+        background: {colors["glass_hover"]};
         border: 1px solid {colors["accent"]};
     }}
 
     QFrame[card="true"][selected="true"] {{
         border: 2px solid {colors["accent"]};
-        background: {colors["accent_light"]};
+        background: {colors["glass_alt"]};
     }}
 
     QLabel[muted="true"] {{
         color: {colors["muted"]};
+    }}
+
+    QLabel[error="true"] {{
+        color: {colors["danger"]};
     }}
 
     QSpinBox {{

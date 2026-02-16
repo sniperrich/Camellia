@@ -25,8 +25,12 @@ def _parse_patchlist(text: str) -> Dict[str, object]:
 
 
 def get_patch_versions() -> Dict[str, object]:
-    client = HttpClient()
+    # Align with Fantnel/OpenSDK behavior: patch list is normally requested with
+    # a launcher-like User-Agent rather than Python's default UA.
+    client = HttpClient(default_headers={"User-Agent": DEFAULT_API_USER_AGENT})
     response = client.get(X19_PATCH_LIST_URL)
+    if response.status >= 400:
+        raise RuntimeError(f"patch list request failed {response.status}: {response.text()}")
     return _parse_patchlist(response.text())
 
 

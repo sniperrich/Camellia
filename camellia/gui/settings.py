@@ -6,10 +6,12 @@ Handles application settings persistence and retrieval with Material 3 theme sup
 
 import json
 import os
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 from PySide6.QtCore import QObject, Signal
 
+_LOGGER = logging.getLogger("camellia.settings")
 
 class Settings(QObject):
     """
@@ -33,7 +35,7 @@ class Settings(QObject):
         'font_size': 'medium',  # 'small', 'medium', 'large'
 
         # Network
-        'default_proxy_port': 6445,
+        'default_proxy_port': 25570,
         'auto_increment_port': True,
         'connection_timeout': 30,
         'max_retries': 3,
@@ -49,6 +51,24 @@ class Settings(QObject):
         'auto_load_plugins': True,
         'show_console': False,
         'check_updates': True,
+
+        # Auth gateway
+        'auth_base_url': 'https://api.taylorswift.fit',
+        'auth_access_token': '',
+        'auth_refresh_token': '',
+        'auth_user': '',
+        'auth_saved_user': '',
+        'auth_saved_password': '',
+        'auth_device_id': '',
+        'auth_auto_login': False,
+        'auth_remember_password': False,
+
+        # Recent server
+        'last_server_id': '',
+        'last_server_name': '',
+        'last_server_version': '',
+        'last_server_address': '',
+        'last_server_time': 0,
     }
 
     def __init__(self):
@@ -76,7 +96,7 @@ class Settings(QObject):
                 self._settings = self.DEFAULTS.copy()
                 self.save()  # Create settings file with defaults
         except Exception as e:
-            print(f"Error loading settings: {e}")
+            _LOGGER.warning("Error loading settings: %s", e)
             self._settings = self.DEFAULTS.copy()
 
     def save(self):
@@ -85,7 +105,7 @@ class Settings(QObject):
             with open(self._settings_path, 'w', encoding='utf-8') as f:
                 json.dump(self._settings, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            _LOGGER.warning("Error saving settings: %s", e)
 
     def get(self, key: str, default: Any = None) -> Any:
         """
@@ -169,7 +189,7 @@ class Settings(QObject):
     @property
     def default_proxy_port(self) -> int:
         """Get default proxy port."""
-        return self.get('default_proxy_port', 6445)
+        return self.get('default_proxy_port', 25570)
 
     @default_proxy_port.setter
     def default_proxy_port(self, value: int):

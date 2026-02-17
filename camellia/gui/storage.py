@@ -20,6 +20,7 @@ class SavedAccount:
     cookie_path: str = ""
     username: str = ""
     password: str = ""
+    sauth_json: str = ""
     remark: str = ""
     sub_mode: str = ""
     remember_password: bool = False
@@ -77,6 +78,26 @@ class SavedAccount:
             last_used=time.time(),
         )
 
+    @classmethod
+    def new_sauth(
+        cls,
+        sauth_json: str,
+        *,
+        remember: bool = True,
+        remark: str = "",
+        username: str = "",
+    ) -> "SavedAccount":
+        return cls(
+            id=str(uuid.uuid4()),
+            mode="sauth",
+            username=username or "SAuth",
+            sauth_json=sauth_json if remember else "",
+            password=sauth_json if remember else "",
+            remark=remark,
+            remember_password=remember,
+            last_used=time.time(),
+        )
+
     @property
     def key(self) -> str:
         if self.mode == "cookie":
@@ -98,6 +119,10 @@ class SavedAccount:
             name = self.username or "未知账号"
             prefix = "网易手机号（密码）" if self.sub_mode == "password" else "网易手机号"
             base = f"{prefix}：{name}"
+            return f"{base} · {self.remark}" if self.remark else base
+        if self.mode == "sauth":
+            name = self.username or "SAuth"
+            base = f"SAuth：{name}"
             return f"{base} · {self.remark}" if self.remark else base
         name = self.username or "未知账号"
         base = f"4399账号：{name}"
@@ -121,6 +146,7 @@ def load_accounts(path: Path | None = None) -> List[SavedAccount]:
                 cookie_path=item.get("cookie_path", ""),
                 username=item.get("username", ""),
                 password=item.get("password", ""),
+                sauth_json=item.get("sauth_json", item.get("password", "")),
                 remark=item.get("remark", ""),
                 sub_mode=item.get("sub_mode", ""),
                 remember_password=bool(item.get("remember_password", False)),

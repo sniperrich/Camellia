@@ -150,7 +150,15 @@ class WPFLauncherClient:
 
     def login_with_cookie(self, raw_cookie: str) -> AuthOtp:
         sauth_json = load_cookie_json(raw_cookie)
-        cookie = json.loads(sauth_json)
+        try:
+            cookie = json.loads(sauth_json)
+        except json.JSONDecodeError as exc:
+            raise ApiError(f"invalid sauth_json: {exc.msg}") from exc
+        if not isinstance(cookie, dict):
+            raise ApiError("invalid sauth_json: expected JSON object")
+        session_id = str(cookie.get("sessionid") or cookie.get("sessionId") or "").strip()
+        if "*" in session_id:
+            raise ApiError("invalid sauth_json: sessionid appears masked")
         login_channel = cookie.get("login_channel", "netease")
         if login_channel != "netease":
             MgbSdk("x19").auth_session(sauth_json)

@@ -28,6 +28,7 @@ from ..api import (
     send_netease_sms,
 )
 from ..api.auth_backend import AuthBackend
+from ..crypto.http_crypto import load_cookie_json
 from ..mc import GameProfile, ModList, ProxyConfig, StandardYggdrasil, UserProfile, YggdrasilData, get_md5_pair
 from ..models import AuthOtp, GameCharacter, GameSkin, NetGameDetail, NetGameItem, NetGameServerAddress
 from ..plugins import PluginState, get_plugin_manager
@@ -323,11 +324,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if isinstance(obj, dict):
             masked = dict(obj)
+            inner = masked.get("sauth_json")
+            if isinstance(inner, str):
+                try:
+                    inner_obj = json.loads(inner)
+                    if isinstance(inner_obj, dict):
+                        masked["sauth_json"] = {
+                            k: (
+                                v[:3] + "***" + v[-3:]
+                                if isinstance(v, str) and k in {"sessionid", "gas_token", "userToken", "token"} and v
+                                else v
+                            )
+                            for k, v in inner_obj.items()
+                        }
+                except Exception:  # pylint: disable=broad-except
+                    pass
             for key in ("sessionid", "gas_token", "userToken", "token"):
                 if key in masked and isinstance(masked[key], str) and masked[key]:
                     masked[key] = masked[key][:3] + "***" + masked[key][-3:]
             # Masked preview is safe enough to show at INFO for debugging.
-            self._logger.info("sauth preview=%s", json.dumps(masked, ensure_ascii=False))
+            self._logger.info(
+                "sauth preview(masked, not reusable)=%s",
+                json.dumps(masked, ensure_ascii=False),
+            )
 
         if not allow_full:
             return
@@ -797,6 +816,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 return account
         return None
 
+    @staticmethod
+    def _parse_sauth_text(sauth_text: str) -> tuple[dict, str, str]:
+        text = (sauth_text or "").strip()
+        if not text:
+            raise ValueError("请输入 sauth_json")
+        try:
+            normalized = load_cookie_json(text)
+        except ValueError as exc:
+            raise ValueError(f"sauth_json 格式错误：{exc}") from exc
+        normalized = (normalized or "").strip()
+        try:
+            payload = json.loads(normalized)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"sauth_json 不是有效 JSON：{exc.msg}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("sauth_json 必须是 JSON 对象")
+        session_id = str(payload.get("sessionid") or payload.get("sessionId") or "").strip()
+        if not session_id:
+            raise ValueError("sauth_json 缺少 sessionid")
+        if "*" in session_id:
+            raise ValueError("sauth_json 的 sessionid 看起来被打码了，请粘贴原始未打码内容")
+        payload["sessionid"] = session_id
+        inner_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        wrapped_json = json.dumps({"sauth_json": inner_json}, ensure_ascii=False, separators=(",", ":"))
+        return payload, inner_json, wrapped_json
+
+    @staticmethod
+    def _build_sauth_account_name(payload: dict, raw: str) -> str:
+        sdkuid = str(payload.get("sdkuid") or "").strip()
+        if sdkuid:
+            return f"sdkuid:{sdkuid}"
+        digest = hashlib.sha1((raw or "").encode("utf-8")).hexdigest()[:10]
+        return f"sauth:{digest}"
+
     def _load_saved_account(self) -> None:
         account = self._current_saved_account()
         if not account:
@@ -821,6 +874,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.login_page.set_netease_phone_login_mode("sms")
                 self.login_page.netease_phone_pass.setText("")
                 self.login_page.netease_code.setText("")
+        elif account.mode == "sauth":
+            self.login_page.select_account_type(3)
+            text = (getattr(account, "sauth_json", "") or account.password or "").strip()
+            if hasattr(self.login_page, "sauth_input"):
+                self.login_page.sauth_input.setPlainText(text)
         # Keep remark in sync for all modes.
         self.login_page.remark_input.setText(getattr(account, "remark", "") or "")
 
@@ -830,7 +888,136 @@ class MainWindow(QtWidgets.QMainWindow):
             self.login_page.set_status("请选择一个已保存账号。", error=True)
             return
         self._load_saved_account()
-        self._handle_login()
+        def proceed() -> None:
+            self._handle_saved_login_impl(account)
+
+        self._ensure_auth_then(
+            reason="登录已保存账号",
+            proceed=proceed,
+            status_cb=self._login_status,
+        )
+
+    def _update_saved_account_sauth(self, account_id: str, wrapped_sauth: str) -> None:
+        if not account_id or not wrapped_sauth:
+            return
+        for account in self._saved_accounts:
+            if account.id != account_id:
+                continue
+            account.sauth_json = wrapped_sauth
+            account.last_used = time.time()
+            save_accounts(self._saved_accounts)
+            self._load_saved_accounts(selected_id=account.id)
+            return
+
+    def _handle_saved_login_impl(self, account: SavedAccount) -> None:
+        self.login_page.clear_status()
+        self.login_page.set_busy(True)
+
+        mode = account.mode
+        display_name = account.username or "已保存账号"
+        remark = account.remark
+        account_id = account.id
+
+        def task() -> tuple[WPFLauncherClient, AuthOtp, str, str]:
+            errors: list[str] = []
+            raw_saved_sauth = (getattr(account, "sauth_json", "") or "").strip()
+            if raw_saved_sauth:
+                try:
+                    _, _, wrapped_sauth = self._parse_sauth_text(raw_saved_sauth)
+                    client = WPFLauncherClient()
+                    self._dump_sauth(f"{mode}:saved_sauth", wrapped_sauth)
+                    auth = client.login_with_cookie(wrapped_sauth)
+                    return client, auth, wrapped_sauth, "sauth"
+                except Exception as exc:  # pylint: disable=broad-except
+                    errors.append(f"SAuth 登录失败：{exc}")
+
+            if mode == "account":
+                username = (account.username or "").strip()
+                password = (account.password or "").strip()
+                if not username or not password:
+                    base = "已保存账号缺少用户名或密码，无法回退账号密码登录。"
+                    if errors:
+                        base = f"{errors[-1]}；{base}"
+                    raise ValueError(base)
+                client = WPFLauncherClient()
+                sauth_json = login_with_password(username, password)
+                _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                self._dump_sauth(f"{mode}:fallback_password", wrapped_sauth)
+                auth = client.login_with_cookie(wrapped_sauth)
+                return client, auth, wrapped_sauth, "fallback_password"
+
+            if mode == "netease_email":
+                email = (account.username or "").strip()
+                password = (account.password or "").strip()
+                if not email or not password:
+                    base = "已保存账号缺少邮箱或密码，无法回退邮箱密码登录。"
+                    if errors:
+                        base = f"{errors[-1]}；{base}"
+                    raise ValueError(base)
+                client = WPFLauncherClient()
+                sauth_json = login_with_netease_email(email, password)
+                _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                self._dump_sauth(f"{mode}:fallback_password", wrapped_sauth)
+                auth = client.login_with_cookie(wrapped_sauth)
+                return client, auth, wrapped_sauth, "fallback_password"
+
+            if mode == "netease_phone":
+                phone = (account.username or "").strip()
+                sub_mode = (getattr(account, "sub_mode", "") or "").strip().lower()
+                password = (account.password or "").strip()
+                if phone and sub_mode == "password" and password:
+                    client = WPFLauncherClient()
+                    email = f"{phone}@163.com"
+                    sauth_json = login_with_netease_email(email, password)
+                    _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                    self._dump_sauth(f"{mode}:fallback_password", wrapped_sauth)
+                    auth = client.login_with_cookie(wrapped_sauth)
+                    return client, auth, wrapped_sauth, "fallback_password"
+                base = "手机号账号未保存密码，且 SAuth 已失效，无法自动回退。请手动验证码登录。"
+                if errors:
+                    base = f"{errors[-1]}；{base}"
+                raise ValueError(base)
+
+            if errors:
+                raise ValueError(errors[-1])
+            raise ValueError("已保存账号缺少可用登录信息。")
+
+        def on_success(result: tuple[WPFLauncherClient, AuthOtp, str, str]) -> None:
+            client, auth, wrapped_sauth, source = result
+            session_id = uuid.uuid4().hex
+            self._sessions[session_id] = SessionState(
+                session_id=session_id,
+                client=client,
+                auth=auth,
+                display_name=display_name or auth.account or auth.entity_id,
+                remark=remark,
+            )
+            self._set_active_session(session_id)
+            self._logger.debug("saved login source=%s user_token=%s", source, auth.token[:4] + "..." if auth.token else "")
+            self._server_offset = 0
+            self.servers_page.reset_state()
+            self._skin_offset = 0
+            self._skin_query = ""
+            self._skin_request_id = 0
+            self._skin_image_pending.clear()
+            self.skins_page.reset_state()
+            self.skins_page.search_input.clear()
+            self._update_saved_account_sauth(account_id, wrapped_sauth)
+            self.login_page.set_busy(False)
+            if source == "sauth":
+                self.login_page.set_status("登录成功（已使用保存的 SAuth）。")
+            else:
+                self.login_page.set_status("登录成功（SAuth 失效，已自动回退账号密码）。")
+            self.switch_page("servers")
+
+        def on_error(message: str) -> None:
+            self.login_page.set_busy(False)
+            if self._show_login_error(message):
+                self.login_page.set_status("登录失败，请查看详细提示。", error=True)
+            else:
+                self.login_page.set_status(message or "登录失败。", error=True)
+
+        self._run_task(task, on_success, on_error)
 
     def _save_current_account(self) -> None:
         mode = self.login_page.login_mode()
@@ -850,7 +1037,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             password = self.login_page.netease_pass.text().strip()
             account = SavedAccount.new_netease_email(email, password, remember, remark=remark)
-        else:
+        elif mode == "netease_phone":
             phone = self.login_page.netease_phone.text().strip()
             if not phone:
                 self.login_page.set_status("请输入手机号。", error=True)
@@ -866,10 +1053,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
+        else:
+            raw_sauth = self.login_page.sauth_input.toPlainText().strip() if hasattr(self.login_page, "sauth_input") else ""
+            try:
+                payload, inner_sauth, wrapped_sauth = self._parse_sauth_text(raw_sauth)
+            except ValueError as exc:
+                self.login_page.set_status(str(exc), error=True)
+                return
+            username = self._build_sauth_account_name(payload, inner_sauth)
+            account = SavedAccount.new_sauth(wrapped_sauth, remember=True, remark=remark, username=username)
 
         for idx, existing in enumerate(self._saved_accounts):
             if existing.mode == account.mode and existing.key == account.key:
                 account.id = existing.id
+                if not getattr(account, "sauth_json", "") and getattr(existing, "sauth_json", ""):
+                    account.sauth_json = existing.sauth_json
                 self._saved_accounts[idx] = account
                 break
         else:
@@ -887,7 +1085,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_saved_accounts()
         self.login_page.set_status("已删除账号。")
 
-    def _auto_save_account(self, mode: str) -> None:
+    def _auto_save_account(self, mode: str, wrapped_sauth: str = "") -> None:
         remember = self._should_remember_password()
         remark = self.login_page.remark_input.text().strip()
         if mode == "account":
@@ -907,10 +1105,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     existing.password = ""
                     existing.remember_password = False
+                if wrapped_sauth:
+                    existing.sauth_json = wrapped_sauth
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
             account = SavedAccount.new_account(username, password, remember, remark=remark)
+            if wrapped_sauth:
+                account.sauth_json = wrapped_sauth
         elif mode == "netease_email":
             email = self.login_page.netease_email.text().strip()
             if not email:
@@ -928,11 +1130,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     existing.password = ""
                     existing.remember_password = False
+                if wrapped_sauth:
+                    existing.sauth_json = wrapped_sauth
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
             account = SavedAccount.new_netease_email(email, password, remember, remark=remark)
-        else:
+            if wrapped_sauth:
+                account.sauth_json = wrapped_sauth
+        elif mode == "netease_phone":
             phone = self.login_page.netease_phone.text().strip()
             if not phone:
                 return
@@ -954,6 +1160,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         existing.remember_password = False
                 else:
                     existing.sub_mode = "sms"
+                if wrapped_sauth:
+                    existing.sauth_json = wrapped_sauth
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
@@ -963,6 +1171,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
+            if wrapped_sauth:
+                account.sauth_json = wrapped_sauth
+        else:
+            raw_sauth = self.login_page.sauth_input.toPlainText().strip() if hasattr(self.login_page, "sauth_input") else ""
+            if not raw_sauth:
+                return
+            if not remember:
+                return
+            try:
+                payload, inner_sauth, wrapped_sauth = self._parse_sauth_text(raw_sauth)
+            except ValueError:
+                return
+            username = self._build_sauth_account_name(payload, inner_sauth)
+            sauth_payload = wrapped_sauth if remember else ""
+            existing = next((item for item in self._saved_accounts if item.mode == "sauth" and item.key == username), None)
+            if existing:
+                existing.username = username
+                existing.last_used = time.time()
+                if remark:
+                    existing.remark = remark
+                existing.sauth_json = sauth_payload
+                existing.password = sauth_payload
+                existing.remember_password = bool(remember and sauth_payload)
+                save_accounts(self._saved_accounts)
+                self._load_saved_accounts(selected_id=existing.id)
+                return
+            account = SavedAccount.new_sauth(sauth_payload, remember=bool(remember and sauth_payload), remark=remark, username=username)
 
         self._saved_accounts.append(account)
         save_accounts(self._saved_accounts)
@@ -993,35 +1228,37 @@ class MainWindow(QtWidgets.QMainWindow):
             password = self.login_page.account_pass.text().strip()
             display_name = username
 
-            def task() -> tuple[WPFLauncherClient, AuthOtp]:
+            def task() -> tuple[WPFLauncherClient, AuthOtp, str]:
                 if not username or not password:
                     raise ValueError("请输入用户名和密码")
                 client = WPFLauncherClient()
                 sauth_json = login_with_password(username, password)
-                self._dump_sauth(mode, sauth_json)
-                auth = client.login_with_cookie(sauth_json)
-                return client, auth
+                _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                self._dump_sauth(mode, wrapped_sauth)
+                auth = client.login_with_cookie(wrapped_sauth)
+                return client, auth, wrapped_sauth
 
         elif mode == "netease_email":
             email = self.login_page.netease_email.text().strip()
             password = self.login_page.netease_pass.text().strip()
             display_name = email
 
-            def task() -> tuple[WPFLauncherClient, AuthOtp]:
+            def task() -> tuple[WPFLauncherClient, AuthOtp, str]:
                 if not email or not password:
                     raise ValueError("请输入邮箱和密码")
                 client = WPFLauncherClient()
                 sauth_json = login_with_netease_email(email, password)
-                self._dump_sauth(mode, sauth_json)
-                auth = client.login_with_cookie(sauth_json)
-                return client, auth
+                _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                self._dump_sauth(mode, wrapped_sauth)
+                auth = client.login_with_cookie(wrapped_sauth)
+                return client, auth, wrapped_sauth
 
-        else:
+        elif mode == "netease_phone":
             phone = self.login_page.netease_phone.text().strip()
             display_name = phone
             phone_mode = self.login_page.netease_phone_login_mode()
 
-            def task() -> tuple[WPFLauncherClient, AuthOtp]:
+            def task() -> tuple[WPFLauncherClient, AuthOtp, str]:
                 if not phone:
                     raise ValueError("请输入手机号")
                 client = WPFLauncherClient()
@@ -1031,19 +1268,31 @@ class MainWindow(QtWidgets.QMainWindow):
                         raise ValueError("请输入密码")
                     email = f"{phone}@163.com"
                     sauth_json = login_with_netease_email(email, password)
-                    self._dump_sauth(f"{mode}:{phone_mode}", sauth_json)
-                    auth = client.login_with_cookie(sauth_json)
-                    return client, auth
+                    _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                    self._dump_sauth(f"{mode}:{phone_mode}", wrapped_sauth)
+                    auth = client.login_with_cookie(wrapped_sauth)
+                    return client, auth, wrapped_sauth
                 code = self.login_page.netease_code.text().strip()
                 if not code:
                     raise ValueError("请输入验证码")
                 sauth_json = login_with_netease_phone(phone, code)
-                self._dump_sauth(f"{mode}:{phone_mode}", sauth_json)
-                auth = client.login_with_cookie(sauth_json)
-                return client, auth
+                _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
+                self._dump_sauth(f"{mode}:{phone_mode}", wrapped_sauth)
+                auth = client.login_with_cookie(wrapped_sauth)
+                return client, auth, wrapped_sauth
+        else:
+            raw_sauth = self.login_page.sauth_input.toPlainText().strip() if hasattr(self.login_page, "sauth_input") else ""
+            display_name = ""
 
-        def on_success(result: tuple[WPFLauncherClient, AuthOtp]) -> None:
-            client, auth = result
+            def task() -> tuple[WPFLauncherClient, AuthOtp, str]:
+                _, _, wrapped_sauth = self._parse_sauth_text(raw_sauth)
+                client = WPFLauncherClient()
+                self._dump_sauth(mode, wrapped_sauth)
+                auth = client.login_with_cookie(wrapped_sauth)
+                return client, auth, wrapped_sauth
+
+        def on_success(result: tuple[WPFLauncherClient, AuthOtp, str]) -> None:
+            client, auth, wrapped_sauth = result
             session_id = uuid.uuid4().hex
             self._sessions[session_id] = SessionState(
                 session_id=session_id,
@@ -1065,7 +1314,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.skins_page.search_input.clear()
             self.login_page.set_busy(False)
             self.login_page.set_status("登录成功。")
-            self._auto_save_account(mode)
+            self._auto_save_account(mode, wrapped_sauth=wrapped_sauth)
             self.switch_page("servers")
 
         def on_error(message: str) -> None:

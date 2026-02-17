@@ -121,7 +121,7 @@ class LoginPage(QtWidgets.QWidget):
         tab_layout.setSpacing(8)
         
         self.account_tabs: list[QtWidgets.QPushButton] = []
-        for label in ("4399 账号", "网易邮箱", "网易手机号"):
+        for label in ("4399 账号", "网易邮箱", "网易手机号", "SAuth"):
             button = QtWidgets.QPushButton(label)
             button.setCheckable(True)
             button.setProperty("variant", "seg")
@@ -145,6 +145,7 @@ class LoginPage(QtWidgets.QWidget):
         self.account_stack.addWidget(self._build_4399_form())
         self.account_stack.addWidget(self._build_netease_email_form())
         self.account_stack.addWidget(self._build_netease_phone_form())
+        self.account_stack.addWidget(self._build_sauth_form())
         layout.addWidget(self.account_stack)
 
         # Remark (optional) for saved accounts
@@ -416,6 +417,25 @@ class LoginPage(QtWidgets.QWidget):
         layout.addStretch()
         return widget
 
+    def _build_sauth_form(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(10)
+
+        self.sauth_input = QtWidgets.QPlainTextEdit()
+        self.sauth_input.setPlaceholderText("粘贴 sauth_json（完整 JSON 文本）")
+        self.sauth_input.setMinimumHeight(120)
+        layout.addWidget(self.sauth_input)
+
+        hint = QtWidgets.QLabel("将直接使用 sauth_json 调用登录流程。")
+        hint.setProperty("muted", "true")
+        hint.setStyleSheet("font-size: 11px;")
+        layout.addWidget(hint)
+
+        layout.addStretch()
+        return widget
+
     def _on_account_type_changed(self, index: int) -> None:
         self.account_stack.setCurrentIndex(index)
 
@@ -431,7 +451,7 @@ class LoginPage(QtWidgets.QWidget):
 
     def login_mode(self) -> str:
         index = self.account_stack.currentIndex()
-        return ["account", "netease_email", "netease_phone"][index]
+        return ["account", "netease_email", "netease_phone", "sauth"][index]
 
     def select_account_type(self, index: int) -> None:
         if 0 <= index < len(self.account_tabs):
@@ -476,6 +496,8 @@ class LoginPage(QtWidgets.QWidget):
         self.netease_phone.setEnabled(not busy)
         self.netease_code.setEnabled(not busy)
         self.sms_send_button.setEnabled(not busy)
+        if hasattr(self, "sauth_input"):
+            self.sauth_input.setEnabled(not busy)
         if hasattr(self, "netease_phone_pass"):
             self.netease_phone_pass.setEnabled(not busy)
         if hasattr(self, "netease_phone_tabs"):

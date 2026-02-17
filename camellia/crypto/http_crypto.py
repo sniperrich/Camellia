@@ -147,6 +147,14 @@ def load_cookie_json(raw_text: str) -> str:
             return raw_text
 
         if isinstance(data, dict) and "sauth_json" in data:
-            return data["sauth_json"]
+            inner = data.get("sauth_json")
+            if isinstance(inner, dict):
+                return json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
+            if not isinstance(inner, str):
+                raise ValueError("sauth_json must be a JSON string or object")
+            inner = inner.strip()
+            if not inner:
+                raise ValueError("sauth_json is empty")
+            return inner
 
     return raw_text

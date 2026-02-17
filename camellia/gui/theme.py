@@ -221,7 +221,28 @@ def build_stylesheet(theme: str = "light") -> str:
         color: white;
     }}
 
-    QTextEdit {{
+    QTextEdit,
+    QPlainTextEdit {{
+        background: {colors["surface_variant"]};
+        border: none;
+        border-bottom: 2px solid {colors["border"]};
+        border-radius: 4px 4px 0 0;
+        padding: 6px 10px;
+        font-size: 14px;
+    }}
+
+    QTextEdit:focus,
+    QPlainTextEdit:focus {{
+        border-bottom: 2px solid {colors["accent"]};
+        background: {colors["surface_variant"]};
+    }}
+
+    QTextEdit:hover,
+    QPlainTextEdit:hover {{
+        background: {colors["panel_alt"]};
+    }}
+
+    QTextEdit[card="true"] {{
         background: {colors["panel"]};
         border: 1px solid {colors["border"]};
         border-radius: 8px;

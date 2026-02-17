@@ -310,7 +310,15 @@ def load_cookie_json(raw_text: str) -> str:
         except json.JSONDecodeError:
             return raw_text
         if isinstance(data, dict) and "sauth_json" in data:
-            return str(data["sauth_json"])
+            inner = data.get("sauth_json")
+            if isinstance(inner, dict):
+                return json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
+            if not isinstance(inner, str):
+                raise ValueError("sauth_json must be a JSON string or object")
+            inner = inner.strip()
+            if not inner:
+                raise ValueError("sauth_json is empty")
+            return inner
     return raw_text
 
 
@@ -1495,7 +1503,15 @@ class WPFLauncherClient:
 
     def login_with_cookie(self, raw_cookie: str) -> AuthOtp:
         sauth_json = load_cookie_json(raw_cookie)
-        cookie = json.loads(sauth_json)
+        try:
+            cookie = json.loads(sauth_json)
+        except json.JSONDecodeError as exc:
+            raise ApiError(f"invalid sauth_json: {exc.msg}") from exc
+        if not isinstance(cookie, dict):
+            raise ApiError("invalid sauth_json: expected JSON object")
+        session_id = str(cookie.get("sessionid") or cookie.get("sessionId") or "").strip()
+        if "*" in session_id:
+            raise ApiError("invalid sauth_json: sessionid appears masked")
         login_channel = cookie.get("login_channel", "netease")
         if login_channel != "netease":
             # Third-party channels (e.g. 4399) may require MGB SDK pre-auth. When it fails,

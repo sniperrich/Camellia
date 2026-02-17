@@ -107,3 +107,22 @@ class ProxyThread(QtCore.QThread):
             future.add_done_callback(lambda _: self._loop.call_soon_threadsafe(self._loop.stop))
         else:
             self._loop.call_soon_threadsafe(self._loop.stop)
+
+    def update_user_token(self, user_token: str) -> None:
+        """
+        Hot-update Yggdrasil token for running proxy without restart.
+
+        The proxy reads token from config.ygg_profile.user.user_token when doing auth,
+        so updating the shared config object is enough for new connections.
+        """
+        user_token = (user_token or "").strip()
+        if not user_token:
+            return
+        profile = getattr(self._config, "ygg_profile", None)
+        user = getattr(profile, "user", None) if profile else None
+        if user is None:
+            return
+        try:
+            user.user_token = user_token
+        except Exception as exc:  # pylint: disable=broad-except
+            _LOGGER.warning("ProxyThread update_user_token failed: %s", exc)

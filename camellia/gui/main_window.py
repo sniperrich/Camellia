@@ -689,13 +689,35 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.connection_page.set_proxy_manager_status("该账号暂无运行中的代理。")
 
+    def _sync_running_proxy_tokens(self, user_id: str, user_token: str) -> None:
+        """
+        If a user re-logs in, we may get a new token. Existing proxies should not be forced
+        to restart; we hot-update their config so new client connections can authenticate.
+        """
+        user_id = (user_id or "").strip()
+        user_token = (user_token or "").strip()
+        if not user_id or not user_token:
+            return
+        for proxy in list(self._managed_proxies):
+            if proxy.user_id != user_id:
+                continue
+            if proxy.user_token == user_token:
+                continue
+            proxy.user_token = user_token
+            try:
+                proxy.thread.update_user_token(user_token)
+            except Exception as exc:  # pylint: disable=broad-except
+                self._logger.debug("Proxy token hot-update failed id=%s: %s", proxy.id, exc)
+
     def _cleanup_duplicate_proxies(self, user_id: str, server_id: str, nickname: str, user_token: str) -> None:
+        # Do not stop all proxies just because the token changed (re-login).
+        # Instead, hot-update tokens for the same user so existing proxies keep working.
+        self._sync_running_proxy_tokens(user_id, user_token)
         for proxy in list(self._managed_proxies):
             same_user = proxy.user_id == user_id
             same_server = proxy.server_id == server_id
             same_nickname = proxy.nickname == nickname
-            token_changed = same_user and proxy.user_token != user_token
-            if (same_user and same_server and same_nickname) or token_changed:
+            if same_user and same_server and same_nickname:
                 self._stop_proxy_thread(proxy)
 
     def _find_proxy_by_thread(self, thread: QtCore.QThread) -> ManagedProxy | None:
@@ -771,6 +793,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_session_id = session_id
         self.session = self._sessions[session_id]
         self.status_label.setText(f"已登录：{self.session.display_label()}")
+        # Re-login may create a new session/token for the same user id. Keep existing proxies alive.
+        if self.session.auth:
+            self._sync_running_proxy_tokens(self.session.auth.entity_id, self.session.auth.token)
         self._set_nav_enabled(servers=True, characters=True, connection=True, skins=True, plugins=True)
         # 清理当前页面缓存，避免混淆不同账号的数据
         self._server_offset = 0

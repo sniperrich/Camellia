@@ -1,0 +1,10 @@
+{
+  "entry": "__init__.py",
+  "meta": {
+    "id": "A03D8FB4-2672-2A94-49DB-D5C0A0F447DB",
+    "name": "Base108X",
+    "description": "1.8版本动画/接发消息",
+    "author": "Murphy",
+    "version": "1.0.0"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "entry": "__init__.py",
+  "meta": {
+    "id": "F110DA9F-F0CB-F926-C72C-FEAC7FCF3601",
+    "name": "Heypixel Protocol",
+    "description": "Heypixel 服务器协议适配",
+    "author": "Murphy",
+    "version": "1.0.0",
+    "dependencies": [
+      "36D701B3-6E98-3E92-AF53-C4EC327B3A71"
+    ]
+  }
+}

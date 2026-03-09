@@ -3686,6 +3686,7 @@ def main() -> int:
 
     client = WPFLauncherClient()
     print("Camellia CLI (standalone single-file)")
+    print("免责声明：该版本仅供学习参考使用，账号出现问题一概不负责")
     print("1) Cookie login (file)")
     print("2) 4399 login (account)")
     mode = _prompt("Choose login mode")

@@ -9,6 +9,7 @@ class LoginErrorDialog(QtWidgets.QDialog):
     def __init__(
         self,
         *,
+        window_title: str = "登录失败",
         title: str,
         reason: str,
         code: int | None = None,
@@ -17,7 +18,7 @@ class LoginErrorDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("登录失败")
+        self.setWindowTitle(window_title)
         self.setModal(True)
         self.setMinimumWidth(420)
 

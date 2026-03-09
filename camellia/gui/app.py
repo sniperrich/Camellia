@@ -17,6 +17,9 @@ from .main_window import MainWindow
 from .auth_gate import AuthGateDialog
 from .auth_bypass import get_auth_bypass_status
 from .settings import get_settings
+from .dialogs import LoginErrorDialog
+
+_STARTUP_DISCLAIMER = "该版本仅供学习参考使用，账号出现问题一概不负责"
 
 
 def main() -> int:
@@ -36,6 +39,13 @@ def main() -> int:
     )
     stylesheet = build_stylesheet(settings.theme)
     app.setStyleSheet(stylesheet)
+
+    LoginErrorDialog(
+        window_title="免责声明",
+        title="免责声明",
+        reason=_STARTUP_DISCLAIMER,
+        parent=None,
+    ).exec()
     
     # Create main window (hidden until gate passes)
     window = MainWindow()

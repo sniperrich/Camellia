@@ -15,6 +15,7 @@ from ..plugins import get_plugin_manager
 from .theme import build_stylesheet
 from .main_window import MainWindow
 from .auth_gate import AuthGateDialog
+from .auth_bypass import get_auth_bypass_status
 from .settings import get_settings
 
 
@@ -39,9 +40,13 @@ def main() -> int:
     # Create main window (hidden until gate passes)
     window = MainWindow()
 
-    gate = AuthGateDialog(window)
-    if gate.exec() != QtWidgets.QDialog.Accepted:
-        return 0
+    bypass_enabled, bypass_source = get_auth_bypass_status()
+    if bypass_enabled:
+        logging.getLogger("camellia.auth").warning("Auth bypass enabled via %s", bypass_source)
+    else:
+        gate = AuthGateDialog(window)
+        if gate.exec() != QtWidgets.QDialog.Accepted:
+            return 0
 
     # Load plugins
     get_plugin_manager().load_plugins(extras={"mode": "gui", "app": app, "window": window})

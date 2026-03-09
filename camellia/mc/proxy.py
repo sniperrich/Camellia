@@ -50,6 +50,13 @@ from ..plugins.events import (
     get_event_bus,
 )
 
+# 对高版本(尤其 1.20.6)兼容性优先：默认不向客户端注入自定义欢迎聊天包。
+ENABLE_WELCOME_PACKET = False
+HEYPIXEL_GAME_ID = "4661334467366178884"
+# 临时兼容补丁默认关闭：直接丢 0x58/0x60 会影响大厅同步，优先保留原始包透传。
+ENABLE_HEYPIXEL_SAFE_DROP = False
+HEYPIXEL_SAFE_DROP_IDS = {0x58, 0x60}
+
 
 class ConnectionState(IntEnum):
     HANDSHAKE = 0
@@ -247,15 +254,18 @@ class _ProxySession:
             f"session start listen={self.config.listen_host}:{self.config.listen_port} "
             f"forward={self.config.forward_host}:{self.config.forward_port}"
         )
-        client_task = asyncio.create_task(self._client_loop())
-        server_task = asyncio.create_task(self._server_loop())
+        client_task = asyncio.create_task(self._client_loop(), name="proxy_client_loop")
+        server_task = asyncio.create_task(self._server_loop(), name="proxy_server_loop")
         done, pending = await asyncio.wait({client_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         for task in done:
+            loop_name = "client" if task is client_task else "server"
             exc = task.exception()
             if exc:
-                self.logger.debug("Session task ended with error: %s", exc)
+                self.logger.warning("[ProxyPhase] %s loop ended with error: %s", loop_name, exc)
+            else:
+                self.logger.info("[ProxyPhase] %s loop ended", loop_name)
         await self._close()
         self._phase("session closed")
 
@@ -304,7 +314,18 @@ class _ProxySession:
                 new_payload = await self._handle_client_packet(packet_id, payload, body)
                 if new_payload is None:
                     continue
-                await self._send_to_server(new_payload)
+                if new_payload is payload:
+                    await self._send_frame_to_server_raw(raw_payload)
+                else:
+                    self.logger.debug(
+                        "[ProxyPhase] rewrite C->S id=0x%02X raw=%s->%s payload=%s->%s",
+                        packet_id,
+                        raw_len,
+                        len(new_payload),
+                        len(payload),
+                        len(new_payload),
+                    )
+                    await self._send_to_server(new_payload)
 
     async def _server_loop(self) -> None:
         while True:
@@ -342,7 +363,18 @@ class _ProxySession:
                 new_payload = await self._handle_server_packet(packet_id, payload, body)
                 if new_payload is None:
                     continue
-                await self._send_to_client(new_payload)
+                if new_payload is payload:
+                    await self._send_frame_to_client_raw(raw_payload)
+                else:
+                    self.logger.debug(
+                        "[ProxyPhase] rewrite S->C id=0x%02X raw=%s->%s payload=%s->%s",
+                        packet_id,
+                        raw_len,
+                        len(new_payload),
+                        len(payload),
+                        len(new_payload),
+                    )
+                    await self._send_to_client(new_payload)
                 if state_before == ConnectionState.PLAY:
                     self._mark_play_packet(packet_id)
                 await self._flush_pending_client_packets()
@@ -357,11 +389,25 @@ class _ProxySession:
         self.server_writer.write(data)
         await self.server_writer.drain()
 
+    async def _send_frame_to_server_raw(self, frame_payload: bytes, *, force_unencrypted: bool = False) -> None:
+        """Forward a pre-framed packet payload as-is (already compressed/uncompressed for this direction)."""
+        data = wrap_packet(frame_payload)
+        if self._cipher is not None and not force_unencrypted:
+            data = self._cipher.encrypt(data)
+        self.server_writer.write(data)
+        await self.server_writer.drain()
+
     async def _send_to_client(self, payload: bytes, *, force_uncompressed: bool = False) -> None:
         data = payload
         if self.client_compression_threshold is not None and not force_uncompressed:
             data = compress_packet(payload, self.client_compression_threshold)
         data = wrap_packet(data)
+        self.client_writer.write(data)
+        await self.client_writer.drain()
+
+    async def _send_frame_to_client_raw(self, frame_payload: bytes) -> None:
+        """Forward a pre-framed packet payload as-is (already compressed/uncompressed for this direction)."""
+        data = wrap_packet(frame_payload)
         self.client_writer.write(data)
         await self.client_writer.drain()
 
@@ -409,9 +455,11 @@ class _ProxySession:
         await self._events.emit("channel_v1122", event)
         if self._is_proto(ProtocolVersion.V1206):
             await self._events.emit("channel_v1206", event)
-        self._welcome_pending = True
+        self._welcome_pending = ENABLE_WELCOME_PACKET
 
     def _mark_play_packet(self, packet_id: int) -> None:
+        if not ENABLE_WELCOME_PACKET:
+            return
         if self._play_seen:
             return
         if packet_id == self._get_play_disconnect_id():
@@ -554,7 +602,17 @@ class _ProxySession:
         try:
             identifier, size = read_string(body, 0, 32767)
         except ProtocolError as exc:
-            self.logger.debug("Plugin message parse failed: %s", exc)
+            preview = body[:96].hex()
+            self.logger.warning(
+                "Plugin message parse failed: dir=%s state=%s proto=%s packet_id=0x%02X body_len=%s err=%s preview=%s",
+                direction.name,
+                self.state.name,
+                self.protocol_version,
+                packet_id,
+                len(body),
+                exc,
+                preview,
+            )
             return payload
         data = body[size:]
         event = PluginMessageEvent(
@@ -565,6 +623,14 @@ class _ProxySession:
         )
         await self._events.emit("plugin_message", event)
         if event.cancelled:
+            self.logger.info(
+                "Plugin message cancelled: dir=%s state=%s proto=%s id=%s payload_len=%s",
+                direction.name,
+                self.state.name,
+                self.protocol_version,
+                identifier,
+                len(data),
+            )
             return None
         new_identifier = event.identifier
         new_payload = event.payload
@@ -841,6 +907,19 @@ class _ProxySession:
             self._handle_disconnect(body)
             return payload
         if self.state == ConnectionState.PLAY:
+            if (
+                ENABLE_HEYPIXEL_SAFE_DROP
+                and self.protocol_version == int(ProtocolVersion.V1206)
+                and str(getattr(self, "game_id", "") or "") == HEYPIXEL_GAME_ID
+                and packet_id in HEYPIXEL_SAFE_DROP_IDS
+            ):
+                self.logger.warning(
+                    "Heuristic drop packet for heypixel safety: id=0x%02X raw=%s len=%s",
+                    packet_id,
+                    len(payload),
+                    len(body),
+                )
+                return None
             if self.protocol_version == int(ProtocolVersion.V108X):
                 if packet_id == 0x26 and len(payload) > 0x200000:
                     try:

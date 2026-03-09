@@ -11,7 +11,6 @@ from pathlib import Path
 
 from ..config import (
     DEFAULT_API_USER_AGENT,
-    FANTNEL_INFO_FALLBACK_URL,
     FANTNEL_INFO_URL,
     X19_API_GATEWAY,
     X19_CORE,
@@ -99,6 +98,9 @@ class WPFLauncherClient:
         )
         self.mcl = HttpClient(
             base_url=X19_MCL,
+            default_headers={"User-Agent": DEFAULT_API_USER_AGENT},
+        )
+        self.nirvana = HttpClient(
             default_headers={"User-Agent": DEFAULT_API_USER_AGENT},
         )
         self.user_id: Optional[str] = None
@@ -290,28 +292,19 @@ class WPFLauncherClient:
             raise ApiError(data.get("message", "create character failed"))
 
     def fetch_fantnel_info(self) -> FantnelInfo:
-        def _fetch(url: str) -> FantnelInfo:
-            response = self.core.get(url)
-            if response.status >= 400:
-                raise ApiError(f"fantnel info error {response.status}")
-            data = json.loads(response.text())
-            payload = data.get("data") if isinstance(data, dict) and "data" in data else data
-            return FantnelInfo.from_dict(payload or {})
-
-        last_err: Exception | None = None
+        response = self.nirvana.get(FANTNEL_INFO_URL)
+        if response.status >= 400:
+            raise ApiError(f"fantnel info error {response.status}: {response.text()}")
         try:
-            info = _fetch(FANTNEL_INFO_URL)
-            if info.crc_salt and info.game_version:
-                return info
-        except Exception as exc:  # pylint: disable=broad-except
-            last_err = exc
-
-        try:
-            return _fetch(FANTNEL_INFO_FALLBACK_URL)
-        except Exception as exc:  # pylint: disable=broad-except
-            if last_err:
-                raise ApiError(f"fantnel info fallback failed: {exc}; primary error: {last_err}") from exc
-            raise
+            payload = json.loads(response.text())
+        except json.JSONDecodeError as exc:
+            raise ApiError(f"fantnel info parse error: {exc.msg}") from exc
+        if not isinstance(payload, dict):
+            raise ApiError("fantnel info invalid payload")
+        info = FantnelInfo.from_dict(payload)
+        if not info.crc_salt or not info.game_version:
+            raise ApiError("fantnel info missing crc_salt/game_version")
+        return info
 
     def get_free_skins(self, offset: int, length: int = 20) -> List[GameSkin]:
         payload = {

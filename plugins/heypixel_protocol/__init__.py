@@ -7,8 +7,10 @@ import json
 import os
 import random
 import struct
+import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -35,9 +37,24 @@ REGISTER_CHANNEL = "minecraft:register"
 BRAND_CHANNEL = "minecraft:brand"
 HEYPIXEL_CHANNEL = "heypixel:s2cevent"
 SYNC_SKINS_CHANNEL = "heypixel:sync_skins"
-DERIVE_KEY_URL = "https://service.codexus.today/third-party/heypixel/derive-key"
+FLOODGATE_FORM_CHANNEL = "floodgate:form"
+FLOODGATE_NETEASE_CHANNEL = "floodgate:netease"
+DERIVE_KEY_URLS = (
+    "https://service.codexus.today/third-party/heypixel/derive-key-v2",
+    "https://service.codexus.today/third-party/heypixel/derive-key",
+)
 SAFE_MINIMAL = False  # 设为 True 可仅回应反射排查踢出；默认关闭以启用完整协议
 TARGET_GAME_ID = "4661334467366178884"
+TARGET_PROTOCOL = 766
+# 对齐官方行为：默认主动回发 register 通道列表。
+ENABLE_REGISTER_REPLY = True
+DERIVE_STRICT_MODE = os.getenv("CAMELLIA_HEYPIXEL_DERIVE_STRICT", "1") != "0"
+# 默认禁用本地推导，避免“看似可用但会话被服务端踢出”。
+LOCAL_DERIVE_FALLBACK = os.getenv("CAMELLIA_HEYPIXEL_LOCAL_DERIVE", "0") != "0"
+LOCAL_DERIVE_SECRET = os.getenv("CAMELLIA_HEYPIXEL_LOCAL_DERIVE_SECRET", "camellia-heypixel-local-v1")
+LOCAL_DERIVE_CACHE_PATH = os.path.expanduser(
+    os.getenv("CAMELLIA_HEYPIXEL_LOCAL_DERIVE_CACHE", "~/.camellia/heypixel_derive_key_cache.json")
+)
 
 MSG_LA5 = 1
 MSG_FSYR = 2  # Heartbeat message
@@ -51,7 +68,9 @@ MSG_TYPE_BLACK_CLASS = 1
 MSG_TYPE_BLACK_MODULE = 2
 MSG_TYPE_REFLECT_CHECK = 3
 
-REGISTER_CHANNELS = [
+# 对齐官方插件 Cls_009 构造函数中的固定补充通道集合。
+# 最终回包会与服务端下发列表合并并去重。
+REGISTER_EXTRA_CHANNELS = [
     "worldedit:cui",
     "bungeequeue:queue",
     "legacy:redisbungee",
@@ -79,7 +98,7 @@ REGISTER_CHANNELS = [
     "minecraft:netregistry",
 ]
 
-SYNC_SKINS_PAYLOAD = base64.b64decode("ASQwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMzliYzYyMTM=")
+SYNC_SKINS_PAYLOAD = b"ASQwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMzliYzYyMTM="
 
 # Naven/decoded 常见路径与默认伪造配置
 DEFAULT_GAME_PATH = "E:\\MCLDownload\\Game\\.minecraft"
@@ -213,13 +232,20 @@ class HeypixelState:
     register_replied: bool = False
     register_payload_hash: str | None = None
     register_candidate_hash: str | None = None
+    client_register_payload_hash: str | None = None
     last_server_channels: list[str] = field(default_factory=list)
+    server_channels_order: list[str] = field(default_factory=list)
     brand_sent: bool = False
     server_channels: set[str] = field(default_factory=set)
     heypixel_detected: bool = False
     profile_uuid: str | None = None
     user_id: int | None = None
+    derive_profile: str | None = None
+    derive_name: str | None = None
+    derive_failed: bool = False
+    derive_error: str | None = None
     derived_key: str | None = None
+    derived_key_source: str | None = None
     crypto: "HeypixelCrypto | None" = None
     derive_task: asyncio.Task | None = None
     info_sent: bool = False
@@ -235,6 +261,7 @@ class HeypixelState:
     black_module_sent: bool = False
     random_uuid: str | None = None
     sync_skins_acked: bool = False
+    heypixel_event_seen: bool = False
 
     def cleanup(self) -> None:
         self.game_joined = False
@@ -243,7 +270,9 @@ class HeypixelState:
         self.register_replied = False
         self.register_payload_hash = None
         self.register_candidate_hash = None
+        self.client_register_payload_hash = None
         self.last_server_channels.clear()
+        self.server_channels_order.clear()
         self.server_channels.clear()
         self.brand_sent = False
         self.heypixel_detected = False
@@ -265,6 +294,12 @@ class HeypixelState:
         self.black_module_sent = False
         self.random_uuid = None
         self.sync_skins_acked = False
+        self.heypixel_event_seen = False
+        self.derived_key_source = None
+        self.derive_profile = None
+        self.derive_name = None
+        self.derive_failed = False
+        self.derive_error = None
 
 
 class HeypixelCrypto:
@@ -307,10 +342,27 @@ def setup(context) -> None:
             f.flush()
 
     write_debug("Heypixel plugin loaded")
+    logger.info(
+        "Heypixel: options register_reply=%s derive_strict=%s local_derive_fallback=%s",
+        ENABLE_REGISTER_REPLY,
+        DERIVE_STRICT_MODE,
+        LOCAL_DERIVE_FALLBACK,
+    )
 
     async def on_login_success(event: LoginSuccessEvent) -> None:
         session = event.session
         if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
+            return
+        if (
+            TARGET_GAME_ID
+            and getattr(session, "game_id", None) == TARGET_GAME_ID
+            and getattr(session, "protocol_version", None) not in (None, TARGET_PROTOCOL)
+        ):
+            logger.warning(
+                "Heypixel: unsupported target protocol %s (expected %s), skip plugin init",
+                getattr(session, "protocol_version", None),
+                TARGET_PROTOCOL,
+            )
             return
         if not _is_supported_version(session):
             return
@@ -326,10 +378,20 @@ def setup(context) -> None:
         session = event.session
         if TARGET_GAME_ID and getattr(session, "game_id", None) not in (None, TARGET_GAME_ID):
             return
+        if (
+            TARGET_GAME_ID
+            and getattr(session, "game_id", None) == TARGET_GAME_ID
+            and getattr(session, "protocol_version", None) not in (None, TARGET_PROTOCOL)
+        ):
+            return
         if not _is_supported_version(session):
             return
         state = _get_state(session)
         state.game_joined = True
+        _ensure_identity(session, state)
+        if state.derive_failed:
+            logger.warning("Heypixel: 跳过 game join 处理，原因=密钥派生失败")
+            return
         if not SAFE_MINIMAL:
             if state.click_tracker is None:
                 state.click_tracker = ClickTracker()
@@ -384,6 +446,11 @@ def setup(context) -> None:
                 return
         if not _is_supported_version(session):
             return
+        if _is_target_session(session, _get_state(session)) and getattr(session, "protocol_version", None) not in (
+            None,
+            TARGET_PROTOCOL,
+        ):
+            return
         state_name = getattr(getattr(session, "state", None), "name", None)
         if state_name not in ("PLAY", "CONFIGURATION"):
             return
@@ -420,6 +487,23 @@ def _handle_serverbound(event: PluginMessageEvent, state: HeypixelState, logger)
     # 非目标服不做任何修改（但仍允许在 clientbound register 中探测到 heypixel 后再启用）。
     if not _is_target_session(event.session, state):
         return
+    if event.identifier == REGISTER_CHANNEL:
+        payload = event.payload
+        if isinstance(payload, memoryview):
+            payload = payload.tobytes()
+        elif isinstance(payload, bytearray):
+            payload = bytes(payload)
+        channels = _parse_channels(payload or b"")
+        state.client_register_payload_hash = hashlib.sha256(payload or b"").hexdigest()
+        state.registered = True
+        # 对齐官方插件：拦截客户端原始 register，由插件自行在时机成熟后回发合并结果。
+        event.cancelled = True
+        logger.info(
+            "Heypixel: dropped serverbound minecraft:register (channels=%s len=%s)",
+            len(channels),
+            len(payload or b""),
+        )
+        return
     if event.identifier == BRAND_CHANNEL:
         # 替换 brand 为 "forge"
         event.payload = _build_brand_payload()
@@ -429,6 +513,18 @@ def _handle_serverbound(event: PluginMessageEvent, state: HeypixelState, logger)
 
 
 async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, logger, write_debug=None) -> None:
+    if event.identifier == FLOODGATE_FORM_CHANNEL:
+        state.heypixel_detected = True
+        if not _is_target_session(event.session, state):
+            return
+        await _handle_floodgate_form_probe(event, logger, write_debug)
+        return
+
+    if event.identifier == FLOODGATE_NETEASE_CHANNEL:
+        state.heypixel_detected = True
+        logger.info("Heypixel: observed floodgate:netease payload_len=%s", len(event.payload or b""))
+        return
+
     # 部分服会在配置/游玩阶段下发 sync_skins 的探测/触发包；原版 DLL 会读 3 个字节并回包 [第2字节, 第3字节, 0x30]。
     # 见 reference/decomp_HeypixelProtocol_2.3.0/I0agb8QOeTA1DrpjwQ/jqHTfYHgwMMw5io1rf.cs:WeL1Sdg2X
     if event.identifier == SYNC_SKINS_CHANNEL:
@@ -450,7 +546,11 @@ async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, l
             write_debug(msg)
         if channels:
             state.last_server_channels = channels
-            state.server_channels.update(channels)
+            for channel in channels:
+                if channel in state.server_channels:
+                    continue
+                state.server_channels.add(channel)
+                state.server_channels_order.append(channel)
             if any(_is_heypixel_channel(ch) for ch in channels):
                 state.heypixel_detected = True
                 msg = "Detected heypixel channels"
@@ -462,6 +562,22 @@ async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, l
             state.register_recv_count += 1
             return
         state.register_recv_count += 1
+        if not ENABLE_REGISTER_REPLY:
+            msg = f"register reply disabled (count={state.register_recv_count})"
+            logger.info("Heypixel: %s", msg)
+            if write_debug:
+                write_debug(msg)
+            return
+        # 对齐官方插件：仅在收到第 2 次 clientbound register 后回一次合并通道列表。
+        if state.register_recv_count < 2:
+            logger.debug(
+                "Heypixel: delay register reply until count=2 (current=%s)",
+                state.register_recv_count,
+            )
+            return
+        if state.register_replied:
+            logger.debug("Heypixel: register reply already sent, skip duplicate")
+            return
         await _send_register_reply_if_needed(event.session, state, logger, write_debug=write_debug, force=False)
         return
 
@@ -470,7 +586,13 @@ async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, l
 
     # 收到 heypixel 专用通道包，标记已检测到。
     state.heypixel_detected = True
+    state.heypixel_event_seen = True
     _log_heypixel_payload("recv", event.payload, state, logger=logger)
+    if state.derive_failed:
+        logger.debug("Heypixel: skip heypixel secure handling, derive already failed")
+        return
+    if not state.info_sent:
+        await _send_info(event.session, state, logger)
     decoded = _decode_event_payload(event.payload)
     if not decoded:
         return
@@ -496,10 +618,16 @@ async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, l
         else:
             return
 
-    if req.get("type") != MSG_TYPE_REFLECT_CHECK:
+    req_type = int(req.get("type") or -1)
+    if req_type == MSG_TYPE_REFLECT_CHECK:
+        await _send_reflect_response(event.session, state, req, logger)
         return
-
-    await _send_reflect_response(event.session, state, req, logger)
+    if req_type == MSG_TYPE_BLACK_CLASS:
+        await _send_black_class_response(event.session, state, req, logger)
+        return
+    if req_type == MSG_TYPE_BLACK_MODULE:
+        await _send_black_module_response(event.session, state, req, logger)
+        return
 
 
 def _ensure_identity(session, state: HeypixelState) -> None:
@@ -509,29 +637,159 @@ def _ensure_identity(session, state: HeypixelState) -> None:
         state.user_id = _get_user_id(session)
 
 
+def _normalize_profile_identifier(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return str(uuid.UUID(text))
+    except Exception:
+        pass
+    compact = text.replace("-", "").strip()
+    if len(compact) == 32:
+        try:
+            return str(uuid.UUID(compact))
+        except Exception:
+            return compact.lower()
+    return text
+
+
+def _short_sha256(value: str) -> str:
+    try:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+
+def _build_derive_params(session, state: HeypixelState) -> tuple[str, int, str, str]:
+    profile_source = "session.player_uuid"
+    profile_value = _normalize_profile_identifier(getattr(session, "player_uuid", None))
+    if not profile_value:
+        profile_source = "state.profile_uuid"
+        profile_value = _normalize_profile_identifier(state.profile_uuid)
+    if not profile_value:
+        raise ValueError("missing profile identifier for derive-key")
+
+    user_source = "session.config.ygg_profile.user.user_id"
+    user_id = _get_user_id(session)
+    if user_id == 0:
+        user_source = "fallback:0"
+
+    cfg = getattr(session, "config", None)
+    name_raw = getattr(cfg, "nickname", "") if cfg else ""
+    name = (name_raw or "").strip() or _get_name(session)
+    name_source = "session.config.nickname" if name_raw else "fallback:player"
+
+    state.derive_profile = profile_value
+    state.derive_name = name
+    state.profile_uuid = profile_value
+    state.user_id = user_id
+    return profile_value, user_id, name, f"profile={profile_source},user={user_source},name={name_source}"
+
+
+def _cancel_task(task: asyncio.Task | None) -> None:
+    if task and not task.done():
+        task.cancel()
+
+
+def _cancel_runtime_tasks(state: HeypixelState, *, include_derive: bool = False) -> None:
+    _cancel_task(state.cps_task)
+    _cancel_task(state.heartbeat_task)
+    state.cps_task = None
+    state.heartbeat_task = None
+    if include_derive:
+        _cancel_task(state.derive_task)
+        state.derive_task = None
+
+
+async def _close_session_streams(session, logger, reason: str) -> None:
+    closed_any = False
+    for writer_name in ("client_writer", "server_writer"):
+        writer = getattr(session, writer_name, None)
+        if writer is None:
+            continue
+        try:
+            if not writer.is_closing():
+                writer.close()
+                closed_any = True
+        except Exception:
+            continue
+    for writer_name in ("client_writer", "server_writer"):
+        writer = getattr(session, writer_name, None)
+        if writer is None:
+            continue
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.5)
+        except Exception:
+            continue
+    if hasattr(session, "_closed"):
+        try:
+            setattr(session, "_closed", True)
+        except Exception:
+            pass
+    if closed_any:
+        logger.warning("Heypixel: session closed due to derive failure (%s)", reason)
+
+
+async def _handle_derive_failure(session, state: HeypixelState, logger, reason: str) -> None:
+    state.derive_failed = True
+    state.derive_error = reason
+    state.derived_key = None
+    state.derived_key_source = None
+    state.crypto = None
+    _cancel_runtime_tasks(state, include_derive=False)
+    if DERIVE_STRICT_MODE:
+        logger.error("Heypixel: 密钥派生失败，按严格模式中止连接: %s", reason)
+        await _close_session_streams(session, logger, reason)
+    else:
+        logger.warning("Heypixel: 密钥派生失败（非严格模式继续）: %s", reason)
+
+
 def _start_derive_key(session, state: HeypixelState, logger) -> None:
-    if state.derived_key or state.derive_task:
+    if state.derive_failed:
         return
-    if not state.profile_uuid:
+    if state.derived_key or state.derive_task:
         return
     if SAFE_MINIMAL:
         return
 
     async def task() -> None:
+        state.derive_failed = False
+        state.derive_error = None
         try:
-            key = await _fetch_derived_key(state.profile_uuid, state.user_id or 0, _get_name(session))
-            if key:
-                state.derived_key = key
-                state.crypto = HeypixelCrypto(key)
-                _refresh_encrypted_strings(state)
-                logger.info("Heypixel: 派生密钥获取成功 (DES)")
-            else:
-                logger.warning("Heypixel: 派生密钥为空")
+            profile_id, user_id, name, source_desc = _build_derive_params(session, state)
         except Exception as exc:
-            logger.warning("Heypixel: 派生密钥失败: %s", exc)
+            await _handle_derive_failure(session, state, logger, f"derive params invalid: {exc}")
+            return
+        logger.info(
+            "Heypixel: derive params profile_sha=%s profile_len=%s user=%s name_sha=%s source=%s",
+            _short_sha256(profile_id),
+            len(profile_id),
+            user_id,
+            _short_sha256(name),
+            source_desc,
+        )
+        try:
+            key, source = await _fetch_derived_key(
+                profile_id,
+                user_id,
+                name,
+                logger=logger,
+            )
+            if not key:
+                raise ValueError("empty derive key")
+            state.derived_key = key
+            state.derived_key_source = source
+            state.crypto = HeypixelCrypto(key)
+            _refresh_encrypted_strings(state)
+            logger.info("Heypixel: 派生密钥获取成功 source=%s (DES)", source)
+        except Exception as exc:
+            await _handle_derive_failure(session, state, logger, str(exc))
+            return
         await _send_info(session, state, logger)
-        await _maybe_send_black_checks(session, state, logger)
-    
+
     state.derive_task = session.create_task(task())
 
 
@@ -556,24 +814,17 @@ def _encrypt_string(state: HeypixelState, text: str) -> str:
 
 
 def _can_send_secure(state: HeypixelState, session) -> bool:
+    if state.derive_failed:
+        return False
     if not state.profile_uuid:
         state.profile_uuid = _get_profile_uuid(session)
-    return bool(state.profile_uuid and state.crypto)
-
-
-async def _maybe_send_black_checks(session, state: HeypixelState, logger) -> None:
-    if not _can_send_secure(state, session):
-        return
-    if not state.info_sent:
-        return
-    if not state.black_class_sent:
-        await _send_black_class_response(session, state, {}, logger)
-    if not state.black_module_sent:
-        await _send_black_module_response(session, state, {}, logger)
+    return bool(state.profile_uuid and state.derived_key and state.crypto)
 
 
 def _start_heartbeat_task(session, state: HeypixelState, logger) -> None:
     if state.heartbeat_task:
+        return
+    if state.derive_failed:
         return
     if SAFE_MINIMAL:
         return
@@ -596,6 +847,8 @@ def _start_heartbeat_task(session, state: HeypixelState, logger) -> None:
 def _start_cps_task(session, state: HeypixelState, logger) -> None:
     if state.cps_task:
         return
+    if state.derive_failed:
+        return
     if SAFE_MINIMAL:
         return
 
@@ -617,6 +870,10 @@ def _start_cps_task(session, state: HeypixelState, logger) -> None:
 
 
 async def _send_cps(session, state: HeypixelState, logger) -> None:
+    if state.derive_failed:
+        return
+    if not state.info_sent:
+        return
     if not state.click_tracker:
         return
     left_cps, right_cps = await state.click_tracker.get_cps()
@@ -637,6 +894,10 @@ async def _send_cps(session, state: HeypixelState, logger) -> None:
 
 
 async def _send_heartbeat(session, state: HeypixelState, logger) -> None:
+    if state.derive_failed:
+        return
+    if not state.info_sent:
+        return
     payload = _build_heartbeat_payload()
     payload = _encode_event_payload(MSG_FSYR, payload, state=state, encrypt=False)
     try:
@@ -659,9 +920,19 @@ async def _send_sync_skins(session, logger) -> None:
 async def _send_info(session, state: HeypixelState, logger) -> None:
     if state.info_sent:
         return
+    if state.derive_failed:
+        logger.debug("Heypixel: skip info send, derive failed")
+        return
     if not state.profile_uuid:
         return
+    if not state.heypixel_event_seen:
+        logger.debug("Heypixel: skip info send, heypixel event not seen yet")
+        return
+    if not state.derived_key:
+        logger.debug("Heypixel: skip info send, derived_key not ready")
+        return
     if state.crypto is None:
+        logger.warning("Heypixel: 跳过基础信息发送，原因=派生密钥不可用")
         return
     if state.enc_profile is None or state.enc_zero is None:
         _refresh_encrypted_strings(state)
@@ -683,7 +954,6 @@ async def _send_info(session, state: HeypixelState, logger) -> None:
         _log_heypixel_payload("send", payload, state, note="info", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         state.info_sent = True
-        await _maybe_send_black_checks(session, state, logger)
         logger.info("Heypixel: 已发送基础信息")
     except ProtocolError as exc:
         logger.warning("Heypixel: 发送基础信息失败: %s", exc)
@@ -694,7 +964,7 @@ async def _send_reflect_response(session, state: HeypixelState, request: dict[st
         state.profile_uuid = _get_profile_uuid(session)
     if not state.profile_uuid:
         return
-    if state.crypto is None:
+    if not state.derived_key or state.crypto is None:
         return
     now_ms = int(time.time() * 1000)
     payload = _build_la5_payload(
@@ -713,7 +983,6 @@ async def _send_reflect_response(session, state: HeypixelState, request: dict[st
         logger.info("Heypixel: 已回应反射校验")
     except ProtocolError as exc:
         logger.warning("Heypixel: 反射校验回应失败: %s", exc)
-    await _maybe_send_black_checks(session, state, logger)
 
 
 async def _send_black_class_response(session, state: HeypixelState, request: dict[str, object], logger) -> None:
@@ -860,28 +1129,211 @@ def _get_name(session) -> str:
     return nickname or "player"
 
 
-async def _fetch_derived_key(profile_uuid: str, user_id: int, name: str) -> str:
-    query = urllib.parse.urlencode({"profile": profile_uuid, "user": user_id, "name": name})
-    url = f"{DERIVE_KEY_URL}?{query}"
-
-    def _request() -> str:
-        with urllib.request.urlopen(url, timeout=8) as response:  # nosec
-            raw = response.read().decode("utf-8", errors="replace")
-        return raw
-
-    raw = await asyncio.to_thread(_request)
-    raw = raw.strip()
-    if not raw:
+def _parse_derived_key_payload(raw: str) -> str:
+    data = raw.strip()
+    if not data:
         return ""
-    if raw.startswith("{"):
+    if data.startswith("{"):
         try:
-            payload = json.loads(raw)
+            payload = json.loads(data)
             for key in ("data", "key", "value"):
                 if key in payload:
                     return str(payload[key]).strip()
         except json.JSONDecodeError:
             pass
-    return raw.strip("\"\n\r\t ")
+    return data.strip("\"\n\r\t ")
+
+
+def _build_local_derive_material(profile_uuid: str, user_id: int, name: str) -> str:
+    normalized_profile = (profile_uuid or "").strip().lower()
+    normalized_name = (name or "").strip().lower()
+    return (
+        f"profile={normalized_profile}|user={int(user_id)}|name={normalized_name}|"
+        f"gid={TARGET_GAME_ID}|proto={TARGET_PROTOCOL}"
+    )
+
+
+def _derive_key_local(profile_uuid: str, user_id: int, name: str) -> str:
+    material = _build_local_derive_material(profile_uuid, user_id, name)
+    key_seed = hashlib.sha256(LOCAL_DERIVE_SECRET.encode("utf-8")).digest()
+    digest = hashlib.blake2b(material.encode("utf-8"), digest_size=32, key=key_seed).hexdigest()
+    # 用 32 位十六进制字符串作为口令，供 DES(PBKDF2) 二次派生使用。
+    return digest[:32]
+
+
+def _derive_cache_lookup(profile_uuid: str, user_id: int, name: str) -> str | None:
+    path = LOCAL_DERIVE_CACHE_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    key_id = _build_local_derive_material(profile_uuid, user_id, name)
+    value = data.get(key_id)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _derive_cache_save(profile_uuid: str, user_id: int, name: str, key: str) -> None:
+    path = LOCAL_DERIVE_CACHE_PATH
+    key_id = _build_local_derive_material(profile_uuid, user_id, name)
+    try:
+        payload: dict[str, str]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            payload = data if isinstance(data, dict) else {}
+        except Exception:
+            payload = {}
+        payload[key_id] = key
+        parent_dir = os.path.dirname(path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return
+
+
+async def _fetch_derived_key(profile_uuid: str, user_id: int, name: str, logger=None) -> tuple[str, str]:
+    query = urllib.parse.urlencode({"profile": profile_uuid, "user": user_id, "name": name})
+    browser_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/132.0.0.0 Safari/537.36"
+    )
+
+    def _request(url: str) -> str:
+        # Ignore OS/system proxies here.
+        # We have seen stale proxy settings route requests to blocked egress IPs (Cloudflare 1010).
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": browser_ua,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Connection": "close",
+            },
+            method="GET",
+        )
+        with opener.open(request, timeout=8) as response:  # nosec
+            raw = response.read().decode("utf-8", errors="replace")
+        return raw
+
+    def _request_with_curl(url: str) -> str:
+        cmd = [
+            "curl",
+            "-sS",
+            "-m",
+            "10",
+            "--noproxy",
+            "*",
+            "-H",
+            f"User-Agent: {browser_ua}",
+            "-H",
+            "Accept: application/json, text/plain, */*",
+            url,
+        ]
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            raise RuntimeError(f"curl exit={proc.returncode} stderr={stderr[:200]}")
+        return proc.stdout
+
+    last_error: Exception | None = None
+    for index, base_url in enumerate(DERIVE_KEY_URLS, start=1):
+        url = f"{base_url}?{query}"
+        try:
+            raw = await asyncio.to_thread(_request, url)
+            key = _parse_derived_key_payload(raw)
+            if key:
+                if logger:
+                    logger.info("Heypixel: 派生密钥接口命中 #%d (%s)", index, base_url)
+                await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key)
+                return key, "remote"
+            if logger:
+                logger.warning("Heypixel: 派生密钥接口返回空数据 #%d (%s)", index, base_url)
+            try:
+                raw2 = await asyncio.to_thread(_request_with_curl, url)
+                key2 = _parse_derived_key_payload(raw2)
+                if key2:
+                    if logger:
+                        logger.info("Heypixel: 派生密钥接口命中(curl) #%d (%s)", index, base_url)
+                    await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key2)
+                    return key2, "remote:curl"
+            except Exception as curl_exc:
+                if logger:
+                    logger.debug("Heypixel: curl 派生密钥回退失败 #%d (%s): %s", index, base_url, curl_exc)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                body = ""
+            if logger:
+                logger.warning(
+                    "Heypixel: 派生密钥接口失败 #%d status=%s (%s) body=%s",
+                    index,
+                    getattr(exc, "code", "unknown"),
+                    base_url,
+                    body or "<empty>",
+                )
+            try:
+                raw2 = await asyncio.to_thread(_request_with_curl, url)
+                key2 = _parse_derived_key_payload(raw2)
+                if key2:
+                    if logger:
+                        logger.info("Heypixel: 派生密钥接口命中(curl回退) #%d (%s)", index, base_url)
+                    await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key2)
+                    return key2, "remote:curl-fallback"
+            except Exception as curl_exc:
+                if logger:
+                    logger.debug("Heypixel: curl 派生密钥回退失败 #%d (%s): %s", index, base_url, curl_exc)
+        except Exception as exc:
+            last_error = exc
+            if logger:
+                logger.warning("Heypixel: 派生密钥请求异常 #%d (%s): %s", index, base_url, exc)
+            try:
+                raw2 = await asyncio.to_thread(_request_with_curl, url)
+                key2 = _parse_derived_key_payload(raw2)
+                if key2:
+                    if logger:
+                        logger.info("Heypixel: 派生密钥接口命中(curl异常回退) #%d (%s)", index, base_url)
+                    await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key2)
+                    return key2, "remote:curl-exception-fallback"
+            except Exception as curl_exc:
+                if logger:
+                    logger.debug("Heypixel: curl 派生密钥回退失败 #%d (%s): %s", index, base_url, curl_exc)
+
+    if not DERIVE_STRICT_MODE:
+        cached_key = await asyncio.to_thread(_derive_cache_lookup, profile_uuid, user_id, name)
+        if cached_key:
+            if logger:
+                logger.warning("Heypixel: 使用本地缓存派生密钥（remote不可用）")
+            return cached_key, "cache"
+    if LOCAL_DERIVE_FALLBACK and not DERIVE_STRICT_MODE:
+        local_key = _derive_key_local(profile_uuid, user_id, name)
+        if logger:
+            logger.warning("Heypixel: 使用本地派生密钥（模拟），可能与官方服务端不一致")
+        return local_key, "local"
+    if last_error is not None:
+        raise last_error
+    return "", "none"
 
 
 def _derive_key_iv(password: str, salt: bytes) -> tuple[bytes, bytes]:
@@ -909,11 +1361,21 @@ def _decrypt_payload(state: HeypixelState, payload: bytes) -> bytes:
 
 
 def _build_register_payload() -> bytes:
-    return _build_register_payload_from_list(REGISTER_CHANNELS)
+    return _build_register_payload_from_list(REGISTER_EXTRA_CHANNELS)
 
 
 def _build_register_payload_from_list(channels: list[str]) -> bytes:
-    return "\x00".join(channels).encode("utf-8")
+    clean: list[str] = []
+    seen = set()
+    for channel in channels:
+        if not channel or channel in seen:
+            continue
+        seen.add(channel)
+        clean.append(channel)
+    if not clean:
+        return b""
+    # 对齐官方 Vvcd52DxKV053tPRIwR.w2pDnotFUo：每个 channel 后都写入 '\0'（含末尾）。
+    return ("\x00".join(clean) + "\x00").encode("utf-8")
 
 
 def _build_brand_payload() -> bytes:
@@ -937,7 +1399,7 @@ def _parse_channels(payload: bytes) -> list[str]:
 def _merge_register_channels(server_channels: list[str]) -> list[str]:
     merged: list[str] = []
     seen = set()
-    for channel in list(server_channels) + REGISTER_CHANNELS:
+    for channel in list(server_channels) + REGISTER_EXTRA_CHANNELS:
         if not channel or channel in seen:
             continue
         seen.add(channel)
@@ -993,8 +1455,6 @@ async def _handle_sync_skins_probe(event: PluginMessageEvent, state: HeypixelSta
         logger.info("Heypixel: %s", msg)
         if write_debug:
             write_debug(msg)
-        # 某些场景只收到一次 register；在确认 heypixel/sync_skins 后兜底回一次。
-        await _send_register_reply_if_needed(event.session, state, logger, write_debug=write_debug, force=True)
     except ProtocolError as exc:
         msg = f"sync_skins probe ack failed: {exc}"
         logger.debug("Heypixel: %s", msg)
@@ -1002,20 +1462,58 @@ async def _handle_sync_skins_probe(event: PluginMessageEvent, state: HeypixelSta
             write_debug(msg)
 
 
+async def _handle_floodgate_form_probe(event: PluginMessageEvent, logger, write_debug=None) -> None:
+    payload = event.payload
+    if isinstance(payload, memoryview):
+        payload = payload.tobytes()
+    elif isinstance(payload, bytearray):
+        payload = bytes(payload)
+    if not payload or len(payload) < 3:
+        msg = f"floodgate:form payload too short ({len(payload or b'')})"
+        logger.debug("Heypixel: %s", msg)
+        if write_debug:
+            write_debug(msg)
+        return
+
+    # 对齐官方逻辑：读取后两个字节，回发 [b1, b2, 0x30]
+    b1 = payload[1]
+    b2 = payload[2]
+    reply = bytes([b1, b2, 0x30])
+    try:
+        await event.session.send_plugin_message(PacketDirection.SERVERBOUND, FLOODGATE_FORM_CHANNEL, reply)
+        msg = f"floodgate:form confirm sent ({reply.hex()})"
+        logger.info("Heypixel: %s", msg)
+        if write_debug:
+            write_debug(msg)
+    except ProtocolError as exc:
+        msg = f"floodgate:form confirm failed: {exc}"
+        logger.debug("Heypixel: %s", msg)
+        if write_debug:
+            write_debug(msg)
+
+
 async def _send_register_reply_if_needed(session, state: HeypixelState, logger, *, write_debug=None, force: bool = False) -> None:
-    merged = _merge_register_channels(state.last_server_channels)
+    if not ENABLE_REGISTER_REPLY:
+        logger.debug("Heypixel: register reply disabled (observe-only)")
+        return
+    source_channels = state.server_channels_order if state.server_channels_order else state.last_server_channels
+    merged = _merge_register_channels(source_channels)
     if not merged:
         return
     payload = _build_register_payload_from_list(merged)
+    if not payload:
+        return
     payload_hash = hashlib.sha256(payload).hexdigest()
     state.register_candidate_hash = payload_hash
-    if not force and state.register_recv_count < 2 and not state.register_replied:
-        logger.debug("Heypixel: 延迟 register 回包，等待更多通道列表（count=%s）", state.register_recv_count)
-        return
-    if payload_hash == state.register_payload_hash and state.register_replied:
+    if not force and payload_hash == state.register_payload_hash:
         return
 
-    msg = "Sending merged register reply"
+    preview_hex = payload[:192].hex()
+    msg = (
+        f"Sending merged register reply (count={state.register_recv_count}, "
+        f"channels={len(merged)}, len={len(payload)}, sha={payload_hash[:12]}, "
+        f"list={merged}, preview={preview_hex})"
+    )
     logger.info("Heypixel: %s", msg)
     if write_debug:
         write_debug(msg)
@@ -1035,13 +1533,12 @@ async def _send_register_reply_if_needed(session, state: HeypixelState, logger, 
 
 
 def _encode_event_payload(msg_id: int, payload: bytes, *, state: HeypixelState | None, encrypt: bool) -> bytes:
-    """Encode with VarInt msg_id + VarInt(len); body含msgpack时间戳，可选DES."""
+    """Encode C2S like official plugin: 0xFA + int32(msgId) + VarInt(bodyLen) + body."""
     timestamp = _pack_long(int(time.time() * 1000))
     body = timestamp + payload
     if encrypt and state is not None:
         body = _encrypt_payload(state, body)
-    # Fantnel/Naven: length = payload_len + 1
-    header = write_varint(msg_id) + write_varint(len(body) + 1)
+    header = b"\xFA" + struct.pack(">i", int(msg_id)) + write_varint(len(body))
     return header + body
 
 
@@ -1101,8 +1598,8 @@ def _build_cps_payload(left_cps: int, right_cps: int) -> bytes:
 
 
 def _build_heartbeat_payload() -> bytes:
-    # 外层 _encode_event_payload 已统一 prepend timestamp，这里保持空体避免“双时间戳”。
-    return b""
+    # 对齐官方 Cls_023：心跳消息体本身也写入当前毫秒时间戳。
+    return _pack_long(int(time.time() * 1000))
 
 
 def _build_info_payload(session, state: HeypixelState) -> bytes:

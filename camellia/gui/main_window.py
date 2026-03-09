@@ -37,6 +37,7 @@ from .theme import build_stylesheet
 from .widgets import Backdrop, CamelliaLogo, NavButton, SkinCard, make_nav_icon, apply_drop_shadow
 from .dialogs import LoginErrorDialog
 from .auth_gate import AuthGateDialog
+from .auth_bypass import get_auth_bypass_status
 from .storage import SavedAccount, load_accounts, save_accounts
 from .workers import ProxyThread, Worker
 from .pages import LoginPage, ServersPage, CharacterPage, ConnectionPage, SkinPage, PluginsPage, SettingsPage
@@ -514,6 +515,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 status_cb("授权未完成，已取消。", error=True)
 
     def _ensure_auth_then(self, reason: str, proceed: callable, status_cb: callable | None = None) -> None:
+        bypass_enabled, bypass_source = get_auth_bypass_status()
+        if bypass_enabled:
+            self._logger.warning("Auth bypass enabled for action=%s via %s", reason, bypass_source)
+            if status_cb:
+                status_cb("本地免授权模式已启用。")
+            proceed()
+            return
+
         access = self.settings.get("auth_access_token", "")
         refresh = self.settings.get("auth_refresh_token", "")
         base_url = self.settings.get("auth_base_url", "https://api.taylorswift.fit")

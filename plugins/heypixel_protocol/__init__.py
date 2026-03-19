@@ -7,12 +7,7 @@ import json
 import os
 import random
 import struct
-import subprocess
-import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -28,8 +23,7 @@ from camellia.plugins.events import (
     PluginMessageEvent,
     SwingArmEvent,
     UseItemEvent,
-    UseItemOnEvent,
-    SetEntityMetadataEvent,
+    UseItemOnEvent
 )
 
 
@@ -39,25 +33,25 @@ HEYPIXEL_CHANNEL = "heypixel:s2cevent"
 SYNC_SKINS_CHANNEL = "heypixel:sync_skins"
 FLOODGATE_FORM_CHANNEL = "floodgate:form"
 FLOODGATE_NETEASE_CHANNEL = "floodgate:netease"
-DERIVE_KEY_URLS = (
-    "https://service.codexus.today/third-party/heypixel/derive-key-v2",
-    "https://service.codexus.today/third-party/heypixel/derive-key",
-)
+# local key derivation (see _do_local_derive)
 SAFE_MINIMAL = False  # 设为 True 可仅回应反射排查踢出；默认关闭以启用完整协议
 TARGET_GAME_ID = "4661334467366178884"
 TARGET_PROTOCOL = 766
 # 对齐官方行为：默认主动回发 register 通道列表。
 ENABLE_REGISTER_REPLY = True
-DERIVE_STRICT_MODE = os.getenv("CAMELLIA_HEYPIXEL_DERIVE_STRICT", "1") != "0"
-# 默认禁用本地推导，避免“看似可用但会话被服务端踢出”。
-LOCAL_DERIVE_FALLBACK = os.getenv("CAMELLIA_HEYPIXEL_LOCAL_DERIVE", "0") != "0"
-LOCAL_DERIVE_SECRET = os.getenv("CAMELLIA_HEYPIXEL_LOCAL_DERIVE_SECRET", "camellia-heypixel-local-v1")
-LOCAL_DERIVE_CACHE_PATH = os.path.expanduser(
-    os.getenv("CAMELLIA_HEYPIXEL_LOCAL_DERIVE_CACHE", "~/.camellia/heypixel_derive_key_cache.json")
-)
+
+# V1-V4 枚举数据（来自 EnumC0625x71658c91.java 第 166-169 行，明文硬编码在字节码中）
+# 每个版本：version_nums + rules（(segment_idx, pos, length)）
+# 对应 C0532.m5392 密钥派生算法：SHA-256(uuid:userId:versionChar) → splice into random UUID
+HEYPIXEL_DERIVE_VERSIONS = [
+    {"version_nums": ["4", "1", "5", "2"], "rules": [(1, 0, 2), (2, 2, 1), (4, 4, 3)]},  # V1
+    {"version_nums": ["c", "f", "0", "d"], "rules": [(1, 1, 1), (2, 1, 2), (4, 2, 3)]},  # V2
+    {"version_nums": ["e", "3", "9", "8"], "rules": [(1, 1, 3), (2, 1, 2), (4, 2, 1)]},  # V3
+    {"version_nums": ["a", "b", "7", "6"], "rules": [(1, 1, 2), (2, 1, 2), (4, 2, 2)]},  # V4
+]
 
 MSG_LA5 = 1
-MSG_FSYR = 2  # Heartbeat message
+MSG_FSYR = 7  # HeartbeatTokenPacket (C0169): long + String
 MSG_OWX2 = 3  # CPS message
 MSG_CMESSAGE_BLOCK = 5
 MSG_REFLECT = 101
@@ -133,69 +127,6 @@ CPS_WINDOW_MS = 1000
 CPS_SEND_INTERVAL_MS = 50
 CPS_JITTER_MS = 9
 HEARTBEAT_INTERVAL_MS = 5000
-LOG_HEYPIXEL_TRAFFIC = True
-LOG_HEYPIXEL_MAX_BYTES = 96
-
-_traffic_log_handle = None
-_traffic_log_path = None
-_traffic_log_lock = threading.Lock()
-
-
-def _ensure_traffic_log(logger=None):
-    global _traffic_log_handle, _traffic_log_path
-    if not LOG_HEYPIXEL_TRAFFIC:
-        return None
-    if _traffic_log_handle is not None:
-        return _traffic_log_handle
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "logs"))
-    try:
-        os.makedirs(base_dir, exist_ok=True)
-        session_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{random.randint(0, 0xFFFF):04x}"
-        _traffic_log_path = os.path.join(base_dir, f"heypixel-traffic-{session_id}.log")
-        _traffic_log_handle = open(_traffic_log_path, "a", encoding="utf-8", buffering=1)
-        _traffic_log_handle.write(f"# heypixel_traffic {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        if logger is not None:
-            logger.info("Heypixel: traffic log: %s", _traffic_log_path)
-    except OSError:
-        _traffic_log_handle = None
-        _traffic_log_path = None
-    return _traffic_log_handle
-
-
-def _log_heypixel_payload(direction: str, payload: bytes, state: HeypixelState | None = None, note: str = "", logger=None) -> None:
-    handle = _ensure_traffic_log(logger)
-    if handle is None:
-        return
-    data = payload.tobytes() if isinstance(payload, memoryview) else payload
-    if isinstance(data, bytearray):
-        data = bytes(data)
-    msg_id = None
-    inner_len = None
-    decoded = None
-    decoded = _decode_event_payload(data)
-    if decoded:
-        msg_id = decoded[0]
-        inner_len = len(decoded[1])
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts} {direction} msg={msg_id if msg_id is not None else '?'} len={len(data)}"
-    if inner_len is not None:
-        line += f" inner={inner_len}"
-    if note:
-        line += f" note={note}"
-    if decoded and msg_id == MSG_LA5 and state and state.crypto:
-        try:
-            decrypted = _decrypt_payload(state, decoded[1])
-            line += f" dec_len={len(decrypted)}"
-        except Exception:
-            line += " dec_err=1"
-    hex_preview = data[:LOG_HEYPIXEL_MAX_BYTES].hex()
-    line += f" hex={hex_preview}"
-    if len(data) > LOG_HEYPIXEL_MAX_BYTES:
-        line += "..."
-    with _traffic_log_lock:
-        handle.write(line + "\n")
-
-
 class ClickTracker:
     def __init__(self) -> None:
         self._left_clicks: deque[int] = deque()
@@ -240,14 +171,8 @@ class HeypixelState:
     heypixel_detected: bool = False
     profile_uuid: str | None = None
     user_id: int | None = None
-    derive_profile: str | None = None
-    derive_name: str | None = None
-    derive_failed: bool = False
-    derive_error: str | None = None
     derived_key: str | None = None
-    derived_key_source: str | None = None
     crypto: "HeypixelCrypto | None" = None
-    derive_task: asyncio.Task | None = None
     info_sent: bool = False
     click_tracker: ClickTracker | None = None
     cps_task: asyncio.Task | None = None
@@ -283,9 +208,6 @@ class HeypixelState:
         if self.heartbeat_task and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
         self.heartbeat_task = None
-        if self.derive_task and not self.derive_task.done():
-            self.derive_task.cancel()
-        self.derive_task = None
         self.click_tracker = None
         self.enc_profile = None
         self.enc_zero = None
@@ -295,11 +217,7 @@ class HeypixelState:
         self.random_uuid = None
         self.sync_skins_acked = False
         self.heypixel_event_seen = False
-        self.derived_key_source = None
-        self.derive_profile = None
-        self.derive_name = None
-        self.derive_failed = False
-        self.derive_error = None
+        self.sync_token = None
 
 
 class HeypixelCrypto:
@@ -342,12 +260,7 @@ def setup(context) -> None:
             f.flush()
 
     write_debug("Heypixel plugin loaded")
-    logger.info(
-        "Heypixel: options register_reply=%s derive_strict=%s local_derive_fallback=%s",
-        ENABLE_REGISTER_REPLY,
-        DERIVE_STRICT_MODE,
-        LOCAL_DERIVE_FALLBACK,
-    )
+    logger.info("Heypixel: options register_reply=%s", ENABLE_REGISTER_REPLY)
 
     async def on_login_success(event: LoginSuccessEvent) -> None:
         session = event.session
@@ -370,7 +283,7 @@ def setup(context) -> None:
         _ensure_identity(session, state)
         # 不在这里主动发送 register/brand，等待客户端发送后拦截替换
         if not SAFE_MINIMAL:
-            _start_derive_key(session, state, logger)
+            _do_local_derive(session, state, logger)
             _start_heartbeat_task(session, state, logger)
             logger.info("Heypixel: Login success process initiated (v=%s)", getattr(session, "protocol_version", "unknown"))
 
@@ -389,9 +302,6 @@ def setup(context) -> None:
         state = _get_state(session)
         state.game_joined = True
         _ensure_identity(session, state)
-        if state.derive_failed:
-            logger.warning("Heypixel: 跳过 game join 处理，原因=密钥派生失败")
-            return
         if not SAFE_MINIMAL:
             if state.click_tracker is None:
                 state.click_tracker = ClickTracker()
@@ -465,13 +375,6 @@ def setup(context) -> None:
         else:
             raise ValueError("Invalid packet direction")
 
-    async def on_set_entity_metadata(event: SetEntityMetadataEvent) -> None:
-        session = event.session
-        if not _is_supported_version(session):
-            return
-        # 暂时只记录日志
-        pass
-
     # 关键：和 Fantnel 一样，在 base_1200 通道注册 PluginMessage 处理器
     # PLAY + CONFIGURATION 都要处理（CONFIGURATION 阶段有 register/brand）
     events.on("base_1200", on_plugin_message, event_type=PluginMessageEvent)
@@ -479,7 +382,6 @@ def setup(context) -> None:
     events.on("base_1200", on_swing_arm, event_type=SwingArmEvent)
     events.on("base_1200", on_use_item, event_type=UseItemEvent)
     events.on("base_1200", on_use_item_on, event_type=UseItemOnEvent)
-    events.on("base_1200", on_set_entity_metadata, event_type=SetEntityMetadataEvent)
     events.on("channel_v1206", on_login_success, event_type=LoginSuccessEvent)
 
 
@@ -587,16 +489,23 @@ async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, l
     # 收到 heypixel 专用通道包，标记已检测到。
     state.heypixel_detected = True
     state.heypixel_event_seen = True
-    _log_heypixel_payload("recv", event.payload, state, logger=logger)
-    if state.derive_failed:
-        logger.debug("Heypixel: skip heypixel secure handling, derive already failed")
-        return
     if not state.info_sent:
         await _send_info(event.session, state, logger)
     decoded = _decode_event_payload(event.payload)
     if not decoded:
         return
     msg_id, payload = decoded
+
+    # S2C 114: SyncTokenPacket (C0386) — server sends a token string; store for heartbeat
+    if msg_id == 114:
+        try:
+            token, _ = _mp_read_string(payload, 0)
+            state.sync_token = token
+            logger.debug("Heypixel: 收到 SyncToken: %.20s...", token)
+        except Exception as exc:
+            logger.debug("Heypixel: SyncToken 解析失败: %s", exc)
+        return
+
     if msg_id != MSG_REFLECT:
         return
 
@@ -637,56 +546,76 @@ def _ensure_identity(session, state: HeypixelState) -> None:
         state.user_id = _get_user_id(session)
 
 
-def _normalize_profile_identifier(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
+
+def _key_material(profile_uuid: str, user_id: str, version_char: str) -> str:
+    """C0532.m5393: SHA-256(uuid:userId:versionChar) → lowercase hex string (64 chars).
+    Replicates MessageDigest.getInstance("SHA-256").digest(input.getBytes()) formatted with %02x.
+    """
+    data = f"{profile_uuid}:{user_id}:{version_char}".encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _derive_key_uuid(profile_uuid: str, user_id: int, base_uuid: str) -> str:
+    """C0532.m5392: derive the DES password UUID from profile_uuid, userId, and a base (random) UUID.
+
+    Algorithm (from EnumC0625x71658c91 + C0532.m5392):
+      1. Split base_uuid by '-' → 5 segments
+      2. Randomly pick a version (V1-V4) and a versionChar from its version_nums array
+      3. Set segments[0][2] = versionChar  (marks which version was used)
+      4. Compute key_material = SHA-256(profile_uuid:userId:versionChar) → 64-char hex
+      5. For each rule (seg_idx, pos, length) at rule_idx:
+           chunk = key_material[rule_idx * length : (rule_idx + 1) * length]
+           segments[seg_idx] = seg[:pos] + chunk + seg[pos+length:]
+      6. Return '-'.join(segments)  ← this UUID string is the PBKDF2 password
+    """
+    version = random.choice(HEYPIXEL_DERIVE_VERSIONS)
+    version_char = random.choice(version["version_nums"])
+
+    segs = list(base_uuid.split("-"))
+    if len(segs) != 5:
+        raise ValueError(f"base_uuid must be a valid UUID, got: {base_uuid!r}")
+
+    # Mark version in segment[0] position 2
+    seg0 = list(segs[0])
+    seg0[2] = version_char
+    segs[0] = "".join(seg0)
+
+    material = _key_material(profile_uuid, str(user_id), version_char)
+
+    for rule_idx, (seg_idx, pos, length) in enumerate(version["rules"]):
+        chunk = material[rule_idx * length : (rule_idx + 1) * length]
+        seg = segs[seg_idx]
+        segs[seg_idx] = seg[:pos] + chunk + seg[pos + length:]
+
+    return "-".join(segs)
+
+
+def _do_local_derive(session, state: HeypixelState, logger) -> None:
+    """Compute the DES key UUID locally using the algorithm from EnumC0625 + C0532.m5392.
+    Sets state.derived_key and state.crypto immediately (no async, no network).
+    """
+    if state.derived_key and state.crypto:
+        return
+    if SAFE_MINIMAL:
+        return
+    profile_uuid = state.profile_uuid or _get_profile_uuid(session) or ""
+    if not profile_uuid:
+        logger.warning("Heypixel: 无法获取 profile_uuid，跳过密钥派生")
+        return
+    user_id = state.user_id if state.user_id is not None else _get_user_id(session)
+    base_uuid = state.random_uuid or str(uuid.uuid4())
+    state.random_uuid = base_uuid
     try:
-        return str(uuid.UUID(text))
-    except Exception:
-        pass
-    compact = text.replace("-", "").strip()
-    if len(compact) == 32:
-        try:
-            return str(uuid.UUID(compact))
-        except Exception:
-            return compact.lower()
-    return text
-
-
-def _short_sha256(value: str) -> str:
-    try:
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-    except Exception:
-        return "unknown"
-
-
-def _build_derive_params(session, state: HeypixelState) -> tuple[str, int, str, str]:
-    profile_source = "session.player_uuid"
-    profile_value = _normalize_profile_identifier(getattr(session, "player_uuid", None))
-    if not profile_value:
-        profile_source = "state.profile_uuid"
-        profile_value = _normalize_profile_identifier(state.profile_uuid)
-    if not profile_value:
-        raise ValueError("missing profile identifier for derive-key")
-
-    user_source = "session.config.ygg_profile.user.user_id"
-    user_id = _get_user_id(session)
-    if user_id == 0:
-        user_source = "fallback:0"
-
-    cfg = getattr(session, "config", None)
-    name_raw = getattr(cfg, "nickname", "") if cfg else ""
-    name = (name_raw or "").strip() or _get_name(session)
-    name_source = "session.config.nickname" if name_raw else "fallback:player"
-
-    state.derive_profile = profile_value
-    state.derive_name = name
-    state.profile_uuid = profile_value
-    state.user_id = user_id
-    return profile_value, user_id, name, f"profile={profile_source},user={user_source},name={name_source}"
+        key = _derive_key_uuid(profile_uuid, user_id, base_uuid)
+        state.derived_key = key
+        state.crypto = HeypixelCrypto(key)
+        _refresh_encrypted_strings(state)
+        logger.info(
+            "Heypixel: 本地密钥派生完成 (profile=%.8s... user=%s key=%.12s...)",
+            profile_uuid, user_id, key,
+        )
+    except Exception as exc:
+        logger.error("Heypixel: 本地密钥派生失败: %s", exc)
 
 
 def _cancel_task(task: asyncio.Task | None) -> None:
@@ -694,103 +623,12 @@ def _cancel_task(task: asyncio.Task | None) -> None:
         task.cancel()
 
 
-def _cancel_runtime_tasks(state: HeypixelState, *, include_derive: bool = False) -> None:
+def _cancel_runtime_tasks(state: HeypixelState) -> None:
     _cancel_task(state.cps_task)
     _cancel_task(state.heartbeat_task)
     state.cps_task = None
     state.heartbeat_task = None
-    if include_derive:
-        _cancel_task(state.derive_task)
-        state.derive_task = None
 
-
-async def _close_session_streams(session, logger, reason: str) -> None:
-    closed_any = False
-    for writer_name in ("client_writer", "server_writer"):
-        writer = getattr(session, writer_name, None)
-        if writer is None:
-            continue
-        try:
-            if not writer.is_closing():
-                writer.close()
-                closed_any = True
-        except Exception:
-            continue
-    for writer_name in ("client_writer", "server_writer"):
-        writer = getattr(session, writer_name, None)
-        if writer is None:
-            continue
-        try:
-            await asyncio.wait_for(writer.wait_closed(), timeout=1.5)
-        except Exception:
-            continue
-    if hasattr(session, "_closed"):
-        try:
-            setattr(session, "_closed", True)
-        except Exception:
-            pass
-    if closed_any:
-        logger.warning("Heypixel: session closed due to derive failure (%s)", reason)
-
-
-async def _handle_derive_failure(session, state: HeypixelState, logger, reason: str) -> None:
-    state.derive_failed = True
-    state.derive_error = reason
-    state.derived_key = None
-    state.derived_key_source = None
-    state.crypto = None
-    _cancel_runtime_tasks(state, include_derive=False)
-    if DERIVE_STRICT_MODE:
-        logger.error("Heypixel: 密钥派生失败，按严格模式中止连接: %s", reason)
-        await _close_session_streams(session, logger, reason)
-    else:
-        logger.warning("Heypixel: 密钥派生失败（非严格模式继续）: %s", reason)
-
-
-def _start_derive_key(session, state: HeypixelState, logger) -> None:
-    if state.derive_failed:
-        return
-    if state.derived_key or state.derive_task:
-        return
-    if SAFE_MINIMAL:
-        return
-
-    async def task() -> None:
-        state.derive_failed = False
-        state.derive_error = None
-        try:
-            profile_id, user_id, name, source_desc = _build_derive_params(session, state)
-        except Exception as exc:
-            await _handle_derive_failure(session, state, logger, f"derive params invalid: {exc}")
-            return
-        logger.info(
-            "Heypixel: derive params profile_sha=%s profile_len=%s user=%s name_sha=%s source=%s",
-            _short_sha256(profile_id),
-            len(profile_id),
-            user_id,
-            _short_sha256(name),
-            source_desc,
-        )
-        try:
-            key, source = await _fetch_derived_key(
-                profile_id,
-                user_id,
-                name,
-                logger=logger,
-            )
-            if not key:
-                raise ValueError("empty derive key")
-            state.derived_key = key
-            state.derived_key_source = source
-            state.crypto = HeypixelCrypto(key)
-            _refresh_encrypted_strings(state)
-            logger.info("Heypixel: 派生密钥获取成功 source=%s (DES)", source)
-        except Exception as exc:
-            await _handle_derive_failure(session, state, logger, str(exc))
-            return
-        await _send_info(session, state, logger)
-
-    state.derive_task = session.create_task(task())
 
 
 def _refresh_encrypted_strings(state: HeypixelState) -> None:
@@ -814,8 +652,6 @@ def _encrypt_string(state: HeypixelState, text: str) -> str:
 
 
 def _can_send_secure(state: HeypixelState, session) -> bool:
-    if state.derive_failed:
-        return False
     if not state.profile_uuid:
         state.profile_uuid = _get_profile_uuid(session)
     return bool(state.profile_uuid and state.derived_key and state.crypto)
@@ -823,8 +659,6 @@ def _can_send_secure(state: HeypixelState, session) -> bool:
 
 def _start_heartbeat_task(session, state: HeypixelState, logger) -> None:
     if state.heartbeat_task:
-        return
-    if state.derive_failed:
         return
     if SAFE_MINIMAL:
         return
@@ -847,8 +681,6 @@ def _start_heartbeat_task(session, state: HeypixelState, logger) -> None:
 def _start_cps_task(session, state: HeypixelState, logger) -> None:
     if state.cps_task:
         return
-    if state.derive_failed:
-        return
     if SAFE_MINIMAL:
         return
 
@@ -870,8 +702,6 @@ def _start_cps_task(session, state: HeypixelState, logger) -> None:
 
 
 async def _send_cps(session, state: HeypixelState, logger) -> None:
-    if state.derive_failed:
-        return
     if not state.info_sent:
         return
     if not state.click_tracker:
@@ -886,7 +716,6 @@ async def _send_cps(session, state: HeypixelState, logger) -> None:
     payload = _build_cps_payload(left_cps, right_cps)
     payload = _encode_event_payload(MSG_OWX2, payload, state=state, encrypt=False)
     try:
-        _log_heypixel_payload("send", payload, state, note=f"cps={left_cps}/{right_cps}", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         state.last_cps = (left_cps, right_cps)
     except ProtocolError:
@@ -894,14 +723,11 @@ async def _send_cps(session, state: HeypixelState, logger) -> None:
 
 
 async def _send_heartbeat(session, state: HeypixelState, logger) -> None:
-    if state.derive_failed:
-        return
     if not state.info_sent:
         return
-    payload = _build_heartbeat_payload()
+    payload = _build_heartbeat_payload(state)
     payload = _encode_event_payload(MSG_FSYR, payload, state=state, encrypt=False)
     try:
-        _log_heypixel_payload("send", payload, state, note="heartbeat", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         logger.debug("Heypixel: 已发送心跳包")
     except ProtocolError as exc:
@@ -919,9 +745,6 @@ async def _send_sync_skins(session, logger) -> None:
 
 async def _send_info(session, state: HeypixelState, logger) -> None:
     if state.info_sent:
-        return
-    if state.derive_failed:
-        logger.debug("Heypixel: skip info send, derive failed")
         return
     if not state.profile_uuid:
         return
@@ -951,7 +774,6 @@ async def _send_info(session, state: HeypixelState, logger) -> None:
     )
     payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
-        _log_heypixel_payload("send", payload, state, note="info", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         state.info_sent = True
         logger.info("Heypixel: 已发送基础信息")
@@ -978,7 +800,6 @@ async def _send_reflect_response(session, state: HeypixelState, request: dict[st
     )
     payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
-        _log_heypixel_payload("send", payload, state, note="reflect", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         logger.info("Heypixel: 已回应反射校验")
     except ProtocolError as exc:
@@ -999,7 +820,6 @@ async def _send_black_class_response(session, state: HeypixelState, request: dic
     )
     payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
-        _log_heypixel_payload("send", payload, state, note="black_class", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         state.black_class_sent = True
         logger.info("Heypixel: 已回应 BlackClass 检查")
@@ -1021,7 +841,6 @@ async def _send_black_module_response(session, state: HeypixelState, request: di
     )
     payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
     try:
-        _log_heypixel_payload("send", payload, state, note="black_module", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
         state.black_module_sent = True
         logger.info("Heypixel: 已回应 BlackModule 检查")
@@ -1070,7 +889,6 @@ async def _send_block_message(session, state: HeypixelState, event: UseItemOnEve
     )
     payload = _encode_event_payload(MSG_CMESSAGE_BLOCK, payload, state=state, encrypt=False)
     try:
-        _log_heypixel_payload("send", payload, state, note="block", logger=logger)
         await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
     except ProtocolError:
         pass
@@ -1127,213 +945,6 @@ def _get_name(session) -> str:
     cfg = getattr(session, "config", None)
     nickname = getattr(cfg, "nickname", "") if cfg else ""
     return nickname or "player"
-
-
-def _parse_derived_key_payload(raw: str) -> str:
-    data = raw.strip()
-    if not data:
-        return ""
-    if data.startswith("{"):
-        try:
-            payload = json.loads(data)
-            for key in ("data", "key", "value"):
-                if key in payload:
-                    return str(payload[key]).strip()
-        except json.JSONDecodeError:
-            pass
-    return data.strip("\"\n\r\t ")
-
-
-def _build_local_derive_material(profile_uuid: str, user_id: int, name: str) -> str:
-    normalized_profile = (profile_uuid or "").strip().lower()
-    normalized_name = (name or "").strip().lower()
-    return (
-        f"profile={normalized_profile}|user={int(user_id)}|name={normalized_name}|"
-        f"gid={TARGET_GAME_ID}|proto={TARGET_PROTOCOL}"
-    )
-
-
-def _derive_key_local(profile_uuid: str, user_id: int, name: str) -> str:
-    material = _build_local_derive_material(profile_uuid, user_id, name)
-    key_seed = hashlib.sha256(LOCAL_DERIVE_SECRET.encode("utf-8")).digest()
-    digest = hashlib.blake2b(material.encode("utf-8"), digest_size=32, key=key_seed).hexdigest()
-    # 用 32 位十六进制字符串作为口令，供 DES(PBKDF2) 二次派生使用。
-    return digest[:32]
-
-
-def _derive_cache_lookup(profile_uuid: str, user_id: int, name: str) -> str | None:
-    path = LOCAL_DERIVE_CACHE_PATH
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    key_id = _build_local_derive_material(profile_uuid, user_id, name)
-    value = data.get(key_id)
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _derive_cache_save(profile_uuid: str, user_id: int, name: str, key: str) -> None:
-    path = LOCAL_DERIVE_CACHE_PATH
-    key_id = _build_local_derive_material(profile_uuid, user_id, name)
-    try:
-        payload: dict[str, str]
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            payload = data if isinstance(data, dict) else {}
-        except Exception:
-            payload = {}
-        payload[key_id] = key
-        parent_dir = os.path.dirname(path)
-        if parent_dir:
-            os.makedirs(parent_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
-    except Exception:
-        return
-
-
-async def _fetch_derived_key(profile_uuid: str, user_id: int, name: str, logger=None) -> tuple[str, str]:
-    query = urllib.parse.urlencode({"profile": profile_uuid, "user": user_id, "name": name})
-    browser_ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/132.0.0.0 Safari/537.36"
-    )
-
-    def _request(url: str) -> str:
-        # Ignore OS/system proxies here.
-        # We have seen stale proxy settings route requests to blocked egress IPs (Cloudflare 1010).
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": browser_ua,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-                "Connection": "close",
-            },
-            method="GET",
-        )
-        with opener.open(request, timeout=8) as response:  # nosec
-            raw = response.read().decode("utf-8", errors="replace")
-        return raw
-
-    def _request_with_curl(url: str) -> str:
-        cmd = [
-            "curl",
-            "-sS",
-            "-m",
-            "10",
-            "--noproxy",
-            "*",
-            "-H",
-            f"User-Agent: {browser_ua}",
-            "-H",
-            "Accept: application/json, text/plain, */*",
-            url,
-        ]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=12,
-            check=False,
-        )
-        if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
-            raise RuntimeError(f"curl exit={proc.returncode} stderr={stderr[:200]}")
-        return proc.stdout
-
-    last_error: Exception | None = None
-    for index, base_url in enumerate(DERIVE_KEY_URLS, start=1):
-        url = f"{base_url}?{query}"
-        try:
-            raw = await asyncio.to_thread(_request, url)
-            key = _parse_derived_key_payload(raw)
-            if key:
-                if logger:
-                    logger.info("Heypixel: 派生密钥接口命中 #%d (%s)", index, base_url)
-                await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key)
-                return key, "remote"
-            if logger:
-                logger.warning("Heypixel: 派生密钥接口返回空数据 #%d (%s)", index, base_url)
-            try:
-                raw2 = await asyncio.to_thread(_request_with_curl, url)
-                key2 = _parse_derived_key_payload(raw2)
-                if key2:
-                    if logger:
-                        logger.info("Heypixel: 派生密钥接口命中(curl) #%d (%s)", index, base_url)
-                    await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key2)
-                    return key2, "remote:curl"
-            except Exception as curl_exc:
-                if logger:
-                    logger.debug("Heypixel: curl 派生密钥回退失败 #%d (%s): %s", index, base_url, curl_exc)
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            body = ""
-            try:
-                body = exc.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                body = ""
-            if logger:
-                logger.warning(
-                    "Heypixel: 派生密钥接口失败 #%d status=%s (%s) body=%s",
-                    index,
-                    getattr(exc, "code", "unknown"),
-                    base_url,
-                    body or "<empty>",
-                )
-            try:
-                raw2 = await asyncio.to_thread(_request_with_curl, url)
-                key2 = _parse_derived_key_payload(raw2)
-                if key2:
-                    if logger:
-                        logger.info("Heypixel: 派生密钥接口命中(curl回退) #%d (%s)", index, base_url)
-                    await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key2)
-                    return key2, "remote:curl-fallback"
-            except Exception as curl_exc:
-                if logger:
-                    logger.debug("Heypixel: curl 派生密钥回退失败 #%d (%s): %s", index, base_url, curl_exc)
-        except Exception as exc:
-            last_error = exc
-            if logger:
-                logger.warning("Heypixel: 派生密钥请求异常 #%d (%s): %s", index, base_url, exc)
-            try:
-                raw2 = await asyncio.to_thread(_request_with_curl, url)
-                key2 = _parse_derived_key_payload(raw2)
-                if key2:
-                    if logger:
-                        logger.info("Heypixel: 派生密钥接口命中(curl异常回退) #%d (%s)", index, base_url)
-                    await asyncio.to_thread(_derive_cache_save, profile_uuid, user_id, name, key2)
-                    return key2, "remote:curl-exception-fallback"
-            except Exception as curl_exc:
-                if logger:
-                    logger.debug("Heypixel: curl 派生密钥回退失败 #%d (%s): %s", index, base_url, curl_exc)
-
-    if not DERIVE_STRICT_MODE:
-        cached_key = await asyncio.to_thread(_derive_cache_lookup, profile_uuid, user_id, name)
-        if cached_key:
-            if logger:
-                logger.warning("Heypixel: 使用本地缓存派生密钥（remote不可用）")
-            return cached_key, "cache"
-    if LOCAL_DERIVE_FALLBACK and not DERIVE_STRICT_MODE:
-        local_key = _derive_key_local(profile_uuid, user_id, name)
-        if logger:
-            logger.warning("Heypixel: 使用本地派生密钥（模拟），可能与官方服务端不一致")
-        return local_key, "local"
-    if last_error is not None:
-        raise last_error
-    return "", "none"
 
 
 def _derive_key_iv(password: str, salt: bytes) -> tuple[bytes, bytes]:
@@ -1533,34 +1144,25 @@ async def _send_register_reply_if_needed(session, state: HeypixelState, logger, 
 
 
 def _encode_event_payload(msg_id: int, payload: bytes, *, state: HeypixelState | None, encrypt: bool) -> bytes:
-    """Encode C2S like official plugin: 0xFA + int32(msgId) + VarInt(bodyLen) + body."""
-    timestamp = _pack_long(int(time.time() * 1000))
-    body = timestamp + payload
+    """C2S wire format: VarInt(msgId) + payload (C0209.m3092 + mo1273 pattern).
+    No framing byte, no length prefix — the plugin channel message itself is length-bounded.
+    """
+    body = payload
     if encrypt and state is not None:
         body = _encrypt_payload(state, body)
-    header = b"\xFA" + struct.pack(">i", int(msg_id)) + write_varint(len(body))
-    return header + body
+    return write_varint(int(msg_id)) + body
 
 
 def _decode_event_payload(payload: bytes) -> tuple[int, bytes] | None:
-    if not payload:
-        return None
+    """S2C wire format: int32(4B BE, packetId) + payload body (C0521.m5315.readInt()).
+    Returns (msg_id, body) or None if too short.
+    """
     data = payload.tobytes() if isinstance(payload, memoryview) else payload
-    # 原版处理仅在 0xFA 帧下解析 heypixel 消息；0xE9 JSON 广播不进此分支。
-    if not data or data[0] != 0xFA:
+    if len(data) < 4:
         return None
     try:
-        offset = 0
-        offset += 1
-        if offset + 4 > len(data):
-            return None
-        msg_id = struct.unpack(">i", data[offset : offset + 4])[0]
-        offset += 4
-        declared_len, size = read_varint(data, offset)
-        offset += size
-        if declared_len < 0 or offset + declared_len > len(data):
-            return None
-        return msg_id, data[offset : offset + declared_len]
+        msg_id = struct.unpack(">i", data[:4])[0]
+        return msg_id, data[4:]
     except Exception:
         return None
 
@@ -1597,9 +1199,9 @@ def _build_cps_payload(left_cps: int, right_cps: int) -> bytes:
     return _pack_int(left_cps) + _pack_int(0)
 
 
-def _build_heartbeat_payload() -> bytes:
-    # 对齐官方 Cls_023：心跳消息体本身也写入当前毫秒时间戳。
-    return _pack_long(int(time.time() * 1000))
+def _build_heartbeat_payload(state: HeypixelState) -> bytes:
+    """C0169 HeartbeatTokenPacket: long(timestamp) + String(syncToken)."""
+    return _pack_long(int(time.time() * 1000)) + _mp_string(state.sync_token or "")
 
 
 def _build_info_payload(session, state: HeypixelState) -> bytes:
@@ -1769,18 +1371,8 @@ def _pack_float(value: float) -> bytes:
 
 
 def _pack_long(value: int) -> bytes:
-    v = int(value)
-    if -32 <= v <= 127:
-        return bytes([v & 0xFF])
-    if -128 <= v <= 127:
-        return b"\xD0" + struct.pack(">b", v)
-    if -32768 <= v <= 32767:
-        return b"\xD1" + struct.pack(">h", v)
-    if -2147483648 <= v <= 2147483647:
-        return b"\xD2" + struct.pack(">i", v)
-    if 0 <= v <= 0xFFFFFFFF:
-        return b"\xCE" + struct.pack(">I", v)
-    return b"\xD3" + struct.pack(">q", v)
+    """Serialize as 8-byte big-endian signed int64 (C0413.m4483, Java writeLong)."""
+    return struct.pack(">q", int(value))
 
 
 def _pack_byte(value: int) -> bytes:
@@ -1788,118 +1380,40 @@ def _pack_byte(value: int) -> bytes:
 
 
 def _pack_int(value: int) -> bytes:
-    v = int(value)
-    if -32 <= v <= 127:
-        return bytes([v & 0xFF])
-    if -128 <= v <= 127:
-        return b"\xD0" + struct.pack(">b", v)
-    if -32768 <= v <= 32767:
-        return b"\xD1" + struct.pack(">h", v)
-    if 0 <= v <= 255:
-        return b"\xCC" + struct.pack(">B", v)
-    if 256 <= v <= 65535:
-        return b"\xCD" + struct.pack(">H", v)
-    if -2147483648 <= v <= 2147483647:
-        return b"\xD2" + struct.pack(">i", v)
-    if 0 <= v <= 0xFFFFFFFF:
-        return b"\xCE" + struct.pack(">I", v)
-    return b"\xD3" + struct.pack(">q", v)
+    """Serialize as 4-byte big-endian signed int32 (C0413.m4490 int field, Java writeInt)."""
+    return struct.pack(">i", int(value))
 
 
 def _pack_bool(value: bool) -> bytes:
-    return b"\xC3" if value else b"\xC2"
+    """Serialize as 1-byte boolean (C0413, Java writeBoolean)."""
+    return b"\x01" if value else b"\x00"
 
 
 def _mp_string(value: str) -> bytes:
+    """Serialize string as VarInt(byteLen) + UTF-8 bytes (C0413.m4490 String field)."""
     data = value.encode("utf-8")
-    length = len(data)
-    if length <= 31:
-        return bytes([0xA0 | length]) + data
-    if length <= 0xFF:
-        return b"\xD9" + bytes([length]) + data
-    if length <= 0xFFFF:
-        return b"\xDA" + struct.pack(">H", length) + data
-    return b"\xDB" + struct.pack(">I", length) + data
+    return write_varint(len(data)) + data
 
 
 def _mp_read_int(data: bytes, offset: int) -> tuple[int, int]:
-    if offset >= len(data):
-        raise ValueError("int out of range")
-    b = data[offset]
-    offset += 1
-    # positive fixint
-    if b <= 0x7F:
-        return b, offset
-    # negative fixint
-    if b >= 0xE0:
-        return b - 0x100, offset
-    if b == 0xD0:
-        if offset >= len(data):
-            raise ValueError("int8 out of range")
-        return struct.unpack(">b", data[offset:offset + 1])[0], offset + 1
-    if b == 0xD1:
-        end = offset + 2
-        if end > len(data):
-            raise ValueError("int16 out of range")
-        return struct.unpack(">h", data[offset:end])[0], end
-    if b == 0xD2:
-        end = offset + 4
-        if end > len(data):
-            raise ValueError("int32 out of range")
-        return struct.unpack(">i", data[offset:end])[0], end
-    if b == 0xD3:
-        end = offset + 8
-        if end > len(data):
-            raise ValueError("int64 out of range")
-        return struct.unpack(">q", data[offset:end])[0], end
-    if b == 0xCC:
-        if offset >= len(data):
-            raise ValueError("uint8 out of range")
-        return data[offset], offset + 1
-    if b == 0xCD:
-        end = offset + 2
-        if end > len(data):
-            raise ValueError("uint16 out of range")
-        return struct.unpack(">H", data[offset:end])[0], end
-    if b == 0xCE:
-        end = offset + 4
-        if end > len(data):
-            raise ValueError("uint32 out of range")
-        return struct.unpack(">I", data[offset:end])[0], end
-    if b == 0xCF:
-        end = offset + 8
-        if end > len(data):
-            raise ValueError("uint64 out of range")
-        return struct.unpack(">Q", data[offset:end])[0], end
-    raise ValueError(f"unsupported int prefix: {hex(b)}")
+    """Read 4-byte big-endian int32 (mirrors C0413 int field deserialization)."""
+    end = offset + 4
+    if end > len(data):
+        raise ValueError("int32 out of range")
+    return struct.unpack(">i", data[offset:end])[0], end
+
+
+def _mp_read_long(data: bytes, offset: int) -> tuple[int, int]:
+    """Read 8-byte big-endian int64 (mirrors C0413 long field deserialization)."""
+    end = offset + 8
+    if end > len(data):
+        raise ValueError("int64 out of range")
+    return struct.unpack(">q", data[offset:end])[0], end
 
 
 def _mp_read_string(data: bytes, offset: int) -> tuple[str, int]:
-    if offset >= len(data):
-        raise ValueError("string out of range")
-    b = data[offset]
-    offset += 1
-    if 0xA0 <= b <= 0xBF:
-        length = b & 0x1F
-    elif b == 0xD9:
-        if offset >= len(data):
-            raise ValueError("str8 length missing")
-        length = data[offset]
-        offset += 1
-    elif b == 0xDA:
-        end = offset + 2
-        if end > len(data):
-            raise ValueError("str16 length missing")
-        length = struct.unpack(">H", data[offset:end])[0]
-        offset = end
-    elif b == 0xDB:
-        end = offset + 4
-        if end > len(data):
-            raise ValueError("str32 length missing")
-        length = struct.unpack(">I", data[offset:end])[0]
-        offset = end
-    else:
-        raise ValueError(f"unsupported string prefix: {hex(b)}")
+    """Read VarInt(byteLen) + UTF-8 string (mirrors C0413 String field deserialization)."""
+    length, offset = read_varint(data, offset)
     end = offset + length
     if end > len(data):
         raise ValueError("string body out of range")
@@ -1907,14 +1421,8 @@ def _mp_read_string(data: bytes, offset: int) -> tuple[str, int]:
 
 
 def _mp_array(items: list[bytes]) -> bytes:
-    length = len(items)
-    if length <= 0x0F:
-        prefix = bytes([0x90 | length])
-    elif length <= 0xFFFF:
-        prefix = b"\xDC" + struct.pack(">H", length)
-    else:
-        prefix = b"\xDD" + struct.pack(">I", length)
-    return prefix + b"".join(items)
+    """Serialize list as int32(count) + concatenated items (C0413 array serialization)."""
+    return struct.pack(">i", len(items)) + b"".join(items)
 
 
 def _get_stable_rng(session, state: HeypixelState) -> random.Random:

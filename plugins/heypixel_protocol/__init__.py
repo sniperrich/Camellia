@@ -506,37 +506,10 @@ async def _handle_clientbound(event: PluginMessageEvent, state: HeypixelState, l
             logger.debug("Heypixel: SyncToken 解析失败: %s", exc)
         return
 
-    if msg_id != MSG_REFLECT:
-        return
-
-    raw = payload
-    try:
-        data = _decrypt_payload(state, payload)
-    except Exception:
-        data = payload
-
-    try:
-        req = _parse_reflect_request(data)
-    except Exception:
-        if data is not raw:
-            try:
-                req = _parse_reflect_request(raw)
-            except Exception as exc:
-                logger.warning("Heypixel: 解析反射请求失败: %s", exc)
-                return
-        else:
-            return
-
-    req_type = int(req.get("type") or -1)
-    if req_type == MSG_TYPE_REFLECT_CHECK:
-        await _send_reflect_response(event.session, state, req, logger)
-        return
-    if req_type == MSG_TYPE_BLACK_CLASS:
-        await _send_black_class_response(event.session, state, req, logger)
-        return
-    if req_type == MSG_TYPE_BLACK_MODULE:
-        await _send_black_module_response(event.session, state, req, logger)
-        return
+    # All other S2C packets (100=PlayerRef, 101=PlayerProfile, 103-113) are server→client
+    # informational packets; we don't need to reply to them.
+    # Old "MSG_REFLECT / ReflectCheck" concept was incorrect — S2C 101 is PlayerProfilePacket.
+    logger.debug("Heypixel: 忽略 S2C msg_id=%d (len=%d)", msg_id, len(payload))
 
 
 def _ensure_identity(session, state: HeypixelState) -> None:
@@ -744,41 +717,13 @@ async def _send_sync_skins(session, logger) -> None:
 
 
 async def _send_info(session, state: HeypixelState, logger) -> None:
+    # C2S 1 = CosmeticUploadPacket (C0430) — cosmetic/skin upload with its own complex format.
+    # We do NOT implement cosmetic upload, so this is intentionally a no-op.
+    # The old "LA5 device info" concept was based on an incorrect early analysis.
     if state.info_sent:
         return
-    if not state.profile_uuid:
-        return
-    if not state.heypixel_event_seen:
-        logger.debug("Heypixel: skip info send, heypixel event not seen yet")
-        return
-    if not state.derived_key:
-        logger.debug("Heypixel: skip info send, derived_key not ready")
-        return
-    if state.crypto is None:
-        logger.warning("Heypixel: 跳过基础信息发送，原因=派生密钥不可用")
-        return
-    if state.enc_profile is None or state.enc_zero is None:
-        _refresh_encrypted_strings(state)
-    if SAFE_MINIMAL:
-        return
-
-    now_ms = int(time.time() * 1000)
-    payload = _build_la5_payload(
-        profile_uuid=state.profile_uuid,
-        msg_type=MSG_TYPE_INFO,
-        text=state.profile_uuid,
-        timestamp=now_ms,
-        extra="",
-        state=state,
-        session=session,
-    )
-    payload = _encode_event_payload(MSG_LA5, payload, state=state, encrypt=True)
-    try:
-        await session.send_plugin_message(PacketDirection.SERVERBOUND, HEYPIXEL_CHANNEL, payload)
-        state.info_sent = True
-        logger.info("Heypixel: 已发送基础信息")
-    except ProtocolError as exc:
-        logger.warning("Heypixel: 发送基础信息失败: %s", exc)
+    state.info_sent = True
+    logger.debug("Heypixel: _send_info no-op (C2S 1 = CosmeticUploadPacket, not implemented)")
 
 
 async def _send_reflect_response(session, state: HeypixelState, request: dict[str, object], logger) -> None:
@@ -1266,18 +1211,19 @@ def _build_block_message_payload(
     head_pitch: float,
     is_hand: bool,
 ) -> bytes:
+    # C2S 5 BlockInteractionPacket (C0344): double×3(pos) + int×2 + double×6 + bool + float×2 + bool
     parts = [
-        _pack_float(player_x),
-        _pack_float(player_y),
-        _pack_float(player_z),
+        _pack_double(player_x),
+        _pack_double(player_y),
+        _pack_double(player_z),
         _pack_int(direction),
         _pack_int(block_type),
-        _pack_float(location_x),
-        _pack_float(location_y),
-        _pack_float(location_z),
-        _pack_float(block_x),
-        _pack_float(block_y),
-        _pack_float(block_z),
+        _pack_double(location_x),
+        _pack_double(location_y),
+        _pack_double(location_z),
+        _pack_double(block_x),
+        _pack_double(block_y),
+        _pack_double(block_z),
         _pack_bool(inside),
         _pack_float(head_yaw),
         _pack_float(head_pitch),
@@ -1367,7 +1313,13 @@ def _build_info_payload_full(session, state: HeypixelState) -> bytes:
 
 
 def _pack_float(value: float) -> bytes:
-    return b"\xCA" + struct.pack(">f", float(value))
+    """Serialize as 4-byte big-endian float32."""
+    return struct.pack(">f", float(value))
+
+
+def _pack_double(value: float) -> bytes:
+    """Serialize as 8-byte big-endian float64 (Java writeDouble)."""
+    return struct.pack(">d", float(value))
 
 
 def _pack_long(value: int) -> bytes:

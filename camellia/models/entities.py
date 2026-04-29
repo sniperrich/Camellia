@@ -142,7 +142,12 @@ class FantnelInfo:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FantnelInfo":
+        game_version = data.get("gameVersion")
+        if not game_version:
+            versions = data.get("versions")
+            if isinstance(versions, list) and versions:
+                game_version = str(versions[0] or "")
         return cls(
             crc_salt=data.get("crcSalt"),
-            game_version=data.get("gameVersion"),
+            game_version=game_version,
         )

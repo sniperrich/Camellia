@@ -43,6 +43,9 @@ from .workers import ProxyThread, Worker
 from .pages import LoginPage, ServersPage, CharacterPage, ConnectionPage, SkinPage, PluginsPage, SettingsPage
 from .settings import get_settings
 
+FORCED_YGG_LAUNCHER_VERSION = "1.15.22.54976"
+FORCED_YGG_CRC_SALT = "D39C81988069E76968CC20AA68855071"
+
 
 def _format_address(host: str, port: int) -> str:
     if not host or not port:
@@ -1793,10 +1796,23 @@ class MainWindow(QtWidgets.QMainWindow):
             include_mods,
         )
 
-        t1 = time.perf_counter()
-        info = self.session.client.fetch_fantnel_info()
-        self._logger.info("ProxyPhase ygg fetch fantnel info %.1fms", (time.perf_counter() - t1) * 1000)
-        if not info.crc_salt:
+        forced_crc_salt = (FORCED_YGG_CRC_SALT or "").strip()
+        crc_salt = ""
+        try:
+            t1 = time.perf_counter()
+            info = self.session.client.fetch_fantnel_info()
+            self._logger.info("ProxyPhase ygg fetch fantnel info %.1fms", (time.perf_counter() - t1) * 1000)
+            crc_salt = (info.crc_salt or "").strip()
+            if not crc_salt and forced_crc_salt:
+                crc_salt = forced_crc_salt
+                self._logger.warning("ProxyPhase ygg crc_salt missing from fantnel, fallback forced value")
+        except Exception as exc:  # pylint: disable=broad-except
+            if forced_crc_salt:
+                crc_salt = forced_crc_salt
+                self._logger.warning("ProxyPhase ygg fetch fantnel failed, fallback forced crc_salt: %s", exc)
+            else:
+                raise
+        if not crc_salt:
             raise RuntimeError("CRC 盐值不可用")
 
         t2 = time.perf_counter()
@@ -1825,9 +1841,9 @@ class MainWindow(QtWidgets.QMainWindow):
             user=UserProfile(user_id=int(self.session.auth.entity_id), user_token=self.session.auth.token),
         )
         ygg_data = YggdrasilData(
-            launcher_version=self.session.client.game_version,
+            launcher_version=FORCED_YGG_LAUNCHER_VERSION or self.session.client.game_version,
             channel="netease",
-            crc_salt=info.crc_salt,
+            crc_salt=crc_salt,
         )
         self._logger.info("ProxyPhase ygg profile ready %.1fms", (time.perf_counter() - t0) * 1000)
         return profile, ygg_data
@@ -1895,6 +1911,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 profile, ygg_data = self._build_ygg_profile(include_mods=True)
             except Exception as exc:  # pylint: disable=broad-except
                 warning = str(exc)
+                self._logger.exception("ProxyPhase ygg profile build failed")
             return profile, ygg_data, warning
 
         def on_success(result: tuple[Optional[GameProfile], Optional[YggdrasilData], str]) -> None:

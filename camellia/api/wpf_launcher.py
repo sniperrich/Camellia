@@ -302,8 +302,10 @@ class WPFLauncherClient:
         if not isinstance(payload, dict):
             raise ApiError("fantnel info invalid payload")
         info = FantnelInfo.from_dict(payload)
-        if not info.crc_salt or not info.game_version:
-            raise ApiError("fantnel info missing crc_salt/game_version")
+        if not info.crc_salt:
+            raise ApiError("fantnel info missing crc_salt")
+        if not info.game_version:
+            self._logger.warning("fantnel info missing game_version, fallback to server detail version")
         return info
 
     def get_free_skins(self, offset: int, length: int = 20) -> List[GameSkin]:

@@ -168,7 +168,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'enable_register',
             'enable_activation',
             'bootstrap_admin',
-            'crc_auth_token',
             'free_until',
         ] as $key) {
             if (isset($_POST[$key])) {
@@ -964,10 +963,6 @@ if ($cardCategoryFilter !== '') {
                     <div>
                         <label>允许跨域</label>
                         <input name="allowed_origins" value="<?= htmlspecialchars($config['allowed_origins'] ?? '*') ?>"/>
-                    </div>
-                    <div>
-                        <label>CRC Auth Token</label>
-                        <input name="crc_auth_token" placeholder="留空不修改"/>
                     </div>
                     <div>
                         <label>Access TTL（秒）</label>

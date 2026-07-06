@@ -340,80 +340,28 @@ class LoginPage(QtWidgets.QWidget):
     def _build_netease_phone_form(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
-        layout.setContentsMargins(0, 10, 0, 0)
-        layout.setSpacing(16)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(10)
 
-        # Phone login method switch: SMS code or password (phone@163.com via email login).
         self.netease_phone = QtWidgets.QLineEdit()
         self.netease_phone.setPlaceholderText("手机号")
         self.netease_phone.setMinimumHeight(38)
-        phone_tabs_container = QtWidgets.QWidget()
-        phone_tabs_layout = QtWidgets.QHBoxLayout(phone_tabs_container)
-        phone_tabs_layout.setContentsMargins(0, 0, 0, 0)
-        phone_tabs_layout.setSpacing(8)
-
-        self.netease_phone_tabs: list[QtWidgets.QPushButton] = []
-        for label in ("短信验证码", "密码登录"):
-            button = QtWidgets.QPushButton(label)
-            button.setCheckable(True)
-            button.setProperty("variant", "seg")
-            self.netease_phone_tabs.append(button)
-            phone_tabs_layout.addWidget(button)
-        phone_tabs_layout.addStretch(1)
-
-        self.netease_phone_group = QtWidgets.QButtonGroup(self)
-        self.netease_phone_group.setExclusive(True)
-        for idx, button in enumerate(self.netease_phone_tabs):
-            self.netease_phone_group.addButton(button, idx)
-        self.netease_phone_tabs[0].setChecked(True)
-
-        layout.addWidget(phone_tabs_container)
-        layout.addSpacing(8)
         layout.addWidget(self.netease_phone)
-        layout.addSpacing(8)
-
-        self.netease_phone_stack = QtWidgets.QStackedWidget()
-
-        # SMS code page
-        sms_page = QtWidgets.QWidget()
-        sms_layout = QtWidgets.QHBoxLayout(sms_page)
-        sms_layout.setContentsMargins(0, 0, 0, 0)
-        sms_layout.setSpacing(8)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
 
         self.netease_code = QtWidgets.QLineEdit()
         self.netease_code.setPlaceholderText("验证码")
         self.netease_code.setMinimumHeight(38)
         self.netease_code.returnPressed.connect(self.login_clicked.emit)
-        sms_layout.addWidget(self.netease_code, 2)
+        row.addWidget(self.netease_code, 2)
 
         self.sms_send_button = QtWidgets.QPushButton("发送验证码")
         self.sms_send_button.setProperty("variant", "ghost")
         self.sms_send_button.setMinimumHeight(38)
         self.sms_send_button.clicked.connect(self.send_sms_clicked.emit)
-        sms_layout.addWidget(self.sms_send_button, 1)
-
-        self.netease_phone_stack.addWidget(sms_page)
-
-        # Password page
-        pwd_page = QtWidgets.QWidget()
-        pwd_layout = QtWidgets.QVBoxLayout(pwd_page)
-        pwd_layout.setContentsMargins(0, 0, 0, 0)
-        pwd_layout.setSpacing(8)
-
-        self.netease_phone_pass = QtWidgets.QLineEdit()
-        self.netease_phone_pass.setPlaceholderText("密码（将使用 手机号@163.com 登录）")
-        self.netease_phone_pass.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.netease_phone_pass.setMinimumHeight(38)
-        self.netease_phone_pass.returnPressed.connect(self.login_clicked.emit)
-        pwd_layout.addWidget(self.netease_phone_pass)
-
-        self.netease_phone_stack.addWidget(pwd_page)
-
-        layout.addWidget(self.netease_phone_stack)
-
-        self.netease_phone_group.buttonClicked.connect(
-            lambda button: self.netease_phone_stack.setCurrentIndex(self.netease_phone_group.id(button))
-        )
+        row.addWidget(self.sms_send_button, 1)
+        layout.addLayout(row)
         layout.addStretch()
         return widget
 
@@ -498,27 +446,13 @@ class LoginPage(QtWidgets.QWidget):
         self.sms_send_button.setEnabled(not busy)
         if hasattr(self, "sauth_input"):
             self.sauth_input.setEnabled(not busy)
-        if hasattr(self, "netease_phone_pass"):
-            self.netease_phone_pass.setEnabled(not busy)
-        if hasattr(self, "netease_phone_tabs"):
-            for button in self.netease_phone_tabs:
-                button.setEnabled(not busy)
         self.remark_input.setEnabled(not busy)
 
     def netease_phone_login_mode(self) -> str:
-        """Return current phone login mode: 'sms' or 'password'."""
-        if hasattr(self, "netease_phone_stack") and self.netease_phone_stack.currentIndex() == 1:
-            return "password"
         return "sms"
 
     def set_netease_phone_login_mode(self, mode: str) -> None:
-        """Set phone login mode: 'sms' or 'password'."""
-        if not hasattr(self, "netease_phone_stack"):
-            return
-        idx = 1 if mode == "password" else 0
-        self.netease_phone_stack.setCurrentIndex(idx)
-        if hasattr(self, "netease_phone_tabs") and 0 <= idx < len(self.netease_phone_tabs):
-            self.netease_phone_tabs[idx].setChecked(True)
+        return
 
     def set_saved_accounts(self, accounts: list[SavedAccount], *, selected_id: str | None = None) -> None:
         self.saved_list.clear()

@@ -191,7 +191,6 @@ function load_config(): array
         'admin_token' => '',
         'allowed_origins' => '*',
         'admin_allow_ip' => '104.245.12.20',
-        'crc_auth_token' => '',
         'free_until' => '0',
     ];
 
@@ -225,7 +224,6 @@ function load_config(): array
         'admin_token' => $map['admin_token'],
         'allowed_origins' => $map['allowed_origins'],
         'admin_allow_ip' => $map['admin_allow_ip'],
-        'crc_auth_token' => $map['crc_auth_token'],
         'free_until' => (int)$map['free_until'],
     ];
     return $config;

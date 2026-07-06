@@ -1,4 +1,7 @@
+import hashlib
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -21,4 +24,52 @@ _MAPPING = {
 def get_md5_pair(version: str) -> Md5Pair:
     if version not in _MAPPING:
         raise KeyError(f"unsupported game version: {version}")
-    return _MAPPING[version]
+    pair = _MAPPING[version]
+    dat_file_md5 = _load_local_dat_file_md5(version) or pair.dat_file_md5
+    return Md5Pair(pair.bootstrap_md5, dat_file_md5)
+
+
+def _load_local_dat_file_md5(version: str) -> str:
+    dat_path = _find_local_dat_file(version)
+    if dat_path is None:
+        return ""
+    digest = hashlib.md5(dat_path.read_bytes()).hexdigest().upper()
+    return digest if len(digest) > 31 else ""
+
+
+def _find_local_dat_file(version: str) -> Path | None:
+    for mc_root in _candidate_minecraft_roots():
+        dat_path = mc_root / "versions" / version / f"{version}.dat"
+        if dat_path.is_file():
+            return dat_path
+    return None
+
+
+def _candidate_minecraft_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def add_root(path: Path) -> None:
+        normalized = str(path).lower()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        roots.append(path)
+
+    def add_base(path_value: str) -> None:
+        value = (path_value or "").strip()
+        if not value:
+            return
+        base = Path(value).expanduser()
+        if base.name.lower() == ".minecraft":
+            add_root(base)
+            return
+        add_root(base / ".minecraft")
+
+    for item in os.getenv("NEL_MC_BASE_PATH", "").split(os.pathsep):
+        add_base(item)
+    add_base(str(Path.cwd() / ".game_cache" / "Game" / "Base"))
+    add_base(str(Path.home() / ".camellia" / ".game_cache" / "Game" / "Base"))
+    add_base(os.getenv("APPDATA", ""))
+    add_base(str(Path.home()))
+    return roots

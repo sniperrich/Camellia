@@ -29,7 +29,19 @@ from ..api import (
 )
 from ..api.auth_backend import AuthBackend
 from ..crypto.http_crypto import load_cookie_json
-from ..mc import GameProfile, ModList, ProxyConfig, StandardYggdrasil, UserProfile, YggdrasilData, get_md5_pair
+from ..mc import (
+    GameProfile,
+    ModList,
+    ProxyConfig,
+    StandardYggdrasil,
+    UserProfile,
+    YggdrasilData,
+    build_fantnel_profile_payload,
+    build_runtime_ygg_data,
+    get_md5_pair,
+    is_backend_authenticated_success,
+    resolve_crc_salt_with_fallback,
+)
 from ..models import AuthOtp, GameCharacter, GameSkin, NetGameDetail, NetGameItem, NetGameServerAddress
 from ..plugins import PluginState, get_plugin_manager
 from ..version import __version__
@@ -39,13 +51,10 @@ from .dialogs import LoginErrorDialog
 from .auth_gate import AuthGateDialog
 from .auth_bypass import get_auth_bypass_status
 from .storage import SavedAccount, load_accounts, save_accounts
+from .saved_login import build_saved_phone_login_error
 from .workers import ProxyThread, Worker
 from .pages import LoginPage, ServersPage, CharacterPage, ConnectionPage, SkinPage, PluginsPage, SettingsPage
 from .settings import get_settings
-
-FORCED_YGG_LAUNCHER_VERSION = "1.15.22.54976"
-FORCED_YGG_CRC_SALT = "D39C81988069E76968CC20AA68855071"
-
 
 def _format_address(host: str, port: int) -> str:
     if not host or not port:
@@ -902,15 +911,8 @@ class MainWindow(QtWidgets.QMainWindow):
         elif account.mode == "netease_phone":
             self.login_page.select_account_type(2)
             self.login_page.netease_phone.setText(account.username)
-            phone_sub_mode = getattr(account, "sub_mode", "") or ("password" if getattr(account, "password", "") else "sms")
-            if phone_sub_mode == "password":
-                self.login_page.set_netease_phone_login_mode("password")
-                self.login_page.netease_phone_pass.setText(account.password)
-                self.login_page.netease_code.setText("")
-            else:
-                self.login_page.set_netease_phone_login_mode("sms")
-                self.login_page.netease_phone_pass.setText("")
-                self.login_page.netease_code.setText("")
+            self.login_page.set_netease_phone_login_mode("sms")
+            self.login_page.netease_code.setText("")
         elif account.mode == "sauth":
             self.login_page.select_account_type(3)
             text = (getattr(account, "sauth_json", "") or account.password or "").strip()
@@ -954,6 +956,48 @@ class MainWindow(QtWidgets.QMainWindow):
         display_name = account.username or "已保存账号"
         remark = account.remark
         account_id = account.id
+
+        task = self._build_saved_login_task(account)
+
+        def on_success(result: tuple[WPFLauncherClient, AuthOtp, str, str]) -> None:
+            client, auth, wrapped_sauth, source = result
+            session_id = uuid.uuid4().hex
+            self._sessions[session_id] = SessionState(
+                session_id=session_id,
+                client=client,
+                auth=auth,
+                display_name=display_name or auth.account or auth.entity_id,
+                remark=remark,
+            )
+            self._set_active_session(session_id)
+            self._logger.debug("saved login source=%s user_token=%s", source, auth.token[:4] + "..." if auth.token else "")
+            self._server_offset = 0
+            self.servers_page.reset_state()
+            self._skin_offset = 0
+            self._skin_query = ""
+            self._skin_request_id = 0
+            self._skin_image_pending.clear()
+            self.skins_page.reset_state()
+            self.skins_page.search_input.clear()
+            self._update_saved_account_sauth(account_id, wrapped_sauth)
+            self.login_page.set_busy(False)
+            if source == "sauth":
+                self.login_page.set_status("登录成功（已使用保存的 SAuth）。")
+            else:
+                self.login_page.set_status("登录成功（SAuth 失效，已自动回退账号密码）。")
+            self.switch_page("servers")
+
+        def on_error(message: str) -> None:
+            self.login_page.set_busy(False)
+            if self._show_login_error(message):
+                self.login_page.set_status("登录失败，请查看详细提示。", error=True)
+            else:
+                self.login_page.set_status(message or "登录失败。", error=True)
+
+        self._run_task(task, on_success, on_error)
+
+    def _build_saved_login_task(self, account: SavedAccount):
+        mode = account.mode
 
         def task() -> tuple[WPFLauncherClient, AuthOtp, str, str]:
             errors: list[str] = []
@@ -999,62 +1043,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 return client, auth, wrapped_sauth, "fallback_password"
 
             if mode == "netease_phone":
-                phone = (account.username or "").strip()
-                sub_mode = (getattr(account, "sub_mode", "") or "").strip().lower()
-                password = (account.password or "").strip()
-                if phone and sub_mode == "password" and password:
-                    client = WPFLauncherClient()
-                    email = f"{phone}@163.com"
-                    sauth_json = login_with_netease_email(email, password)
-                    _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
-                    self._dump_sauth(f"{mode}:fallback_password", wrapped_sauth)
-                    auth = client.login_with_cookie(wrapped_sauth)
-                    return client, auth, wrapped_sauth, "fallback_password"
-                base = "手机号账号未保存密码，且 SAuth 已失效，无法自动回退。请手动验证码登录。"
-                if errors:
-                    base = f"{errors[-1]}；{base}"
-                raise ValueError(base)
+                previous_error = errors[-1] if errors else ""
+                raise ValueError(build_saved_phone_login_error(account, previous_error=previous_error))
 
             if errors:
                 raise ValueError(errors[-1])
             raise ValueError("已保存账号缺少可用登录信息。")
 
-        def on_success(result: tuple[WPFLauncherClient, AuthOtp, str, str]) -> None:
-            client, auth, wrapped_sauth, source = result
-            session_id = uuid.uuid4().hex
-            self._sessions[session_id] = SessionState(
-                session_id=session_id,
-                client=client,
-                auth=auth,
-                display_name=display_name or auth.account or auth.entity_id,
-                remark=remark,
-            )
-            self._set_active_session(session_id)
-            self._logger.debug("saved login source=%s user_token=%s", source, auth.token[:4] + "..." if auth.token else "")
-            self._server_offset = 0
-            self.servers_page.reset_state()
-            self._skin_offset = 0
-            self._skin_query = ""
-            self._skin_request_id = 0
-            self._skin_image_pending.clear()
-            self.skins_page.reset_state()
-            self.skins_page.search_input.clear()
-            self._update_saved_account_sauth(account_id, wrapped_sauth)
-            self.login_page.set_busy(False)
-            if source == "sauth":
-                self.login_page.set_status("登录成功（已使用保存的 SAuth）。")
-            else:
-                self.login_page.set_status("登录成功（SAuth 失效，已自动回退账号密码）。")
-            self.switch_page("servers")
-
-        def on_error(message: str) -> None:
-            self.login_page.set_busy(False)
-            if self._show_login_error(message):
-                self.login_page.set_status("登录失败，请查看详细提示。", error=True)
-            else:
-                self.login_page.set_status(message or "登录失败。", error=True)
-
-        self._run_task(task, on_success, on_error)
+        return task
 
     def _save_current_account(self) -> None:
         mode = self.login_page.login_mode()
@@ -1079,17 +1075,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not phone:
                 self.login_page.set_status("请输入手机号。", error=True)
                 return
-            phone_mode = self.login_page.netease_phone_login_mode()
-            if phone_mode == "password":
-                password = self.login_page.netease_phone_pass.text().strip()
-                if not password:
-                    self.login_page.set_status("请输入密码。", error=True)
-                    return
-                account = SavedAccount.new_netease_phone(
-                    phone, login_mode="password", password=password, remember=remember, remark=remark
-                )
-            else:
-                account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
+            account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
         else:
             raw_sauth = self.login_page.sauth_input.toPlainText().strip() if hasattr(self.login_page, "sauth_input") else ""
             try:
@@ -1179,35 +1165,21 @@ class MainWindow(QtWidgets.QMainWindow):
             phone = self.login_page.netease_phone.text().strip()
             if not phone:
                 return
-            phone_mode = self.login_page.netease_phone_login_mode()
-            password = self.login_page.netease_phone_pass.text().strip() if (remember and phone_mode == "password") else ""
             existing = next((item for item in self._saved_accounts if item.mode == "netease_phone" and item.key == phone), None)
             if existing:
                 existing.username = phone
                 existing.last_used = time.time()
                 if remark:
                     existing.remark = remark
-                if phone_mode == "password":
-                    existing.sub_mode = "password"
-                    if remember and password:
-                        existing.password = password
-                        existing.remember_password = True
-                    else:
-                        existing.password = ""
-                        existing.remember_password = False
-                else:
-                    existing.sub_mode = "sms"
+                existing.sub_mode = "sms"
+                existing.password = ""
+                existing.remember_password = False
                 if wrapped_sauth:
                     existing.sauth_json = wrapped_sauth
                 save_accounts(self._saved_accounts)
                 self._load_saved_accounts(selected_id=existing.id)
                 return
-            if phone_mode == "password":
-                account = SavedAccount.new_netease_phone(
-                    phone, login_mode="password", password=password, remember=remember, remark=remark
-                )
-            else:
-                account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
+            account = SavedAccount.new_netease_phone(phone, login_mode="sms", remark=remark)
             if wrapped_sauth:
                 account.sauth_json = wrapped_sauth
         else:
@@ -1293,28 +1265,17 @@ class MainWindow(QtWidgets.QMainWindow):
         elif mode == "netease_phone":
             phone = self.login_page.netease_phone.text().strip()
             display_name = phone
-            phone_mode = self.login_page.netease_phone_login_mode()
 
             def task() -> tuple[WPFLauncherClient, AuthOtp, str]:
                 if not phone:
                     raise ValueError("请输入手机号")
-                client = WPFLauncherClient()
-                if phone_mode == "password":
-                    password = self.login_page.netease_phone_pass.text().strip()
-                    if not password:
-                        raise ValueError("请输入密码")
-                    email = f"{phone}@163.com"
-                    sauth_json = login_with_netease_email(email, password)
-                    _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
-                    self._dump_sauth(f"{mode}:{phone_mode}", wrapped_sauth)
-                    auth = client.login_with_cookie(wrapped_sauth)
-                    return client, auth, wrapped_sauth
                 code = self.login_page.netease_code.text().strip()
                 if not code:
-                    raise ValueError("请输入验证码")
+                    raise ValueError("请输入手机号和验证码")
+                client = WPFLauncherClient()
                 sauth_json = login_with_netease_phone(phone, code)
                 _, _, wrapped_sauth = self._parse_sauth_text(sauth_json)
-                self._dump_sauth(f"{mode}:{phone_mode}", wrapped_sauth)
+                self._dump_sauth(mode, wrapped_sauth)
                 auth = client.login_with_cookie(wrapped_sauth)
                 return client, auth, wrapped_sauth
         else:
@@ -1796,24 +1757,11 @@ class MainWindow(QtWidgets.QMainWindow):
             include_mods,
         )
 
-        forced_crc_salt = (FORCED_YGG_CRC_SALT or "").strip()
-        crc_salt = ""
-        try:
-            t1 = time.perf_counter()
-            info = self.session.client.fetch_fantnel_info()
-            self._logger.info("ProxyPhase ygg fetch fantnel info %.1fms", (time.perf_counter() - t1) * 1000)
-            crc_salt = (info.crc_salt or "").strip()
-            if not crc_salt and forced_crc_salt:
-                crc_salt = forced_crc_salt
-                self._logger.warning("ProxyPhase ygg crc_salt missing from fantnel, fallback forced value")
-        except Exception as exc:  # pylint: disable=broad-except
-            if forced_crc_salt:
-                crc_salt = forced_crc_salt
-                self._logger.warning("ProxyPhase ygg fetch fantnel failed, fallback forced crc_salt: %s", exc)
-            else:
-                raise
-        if not crc_salt:
-            raise RuntimeError("CRC 盐值不可用")
+        crc_salt, crc_source = resolve_crc_salt_with_fallback(
+            primary_crc_salt=None,
+            primary_game_version=None,
+        )
+        self._logger.info("ProxyPhase ygg crc salt source=%s value=%s", crc_source, crc_salt[:8])
 
         t2 = time.perf_counter()
         pair = get_md5_pair(version)
@@ -1840,9 +1788,8 @@ class MainWindow(QtWidgets.QMainWindow):
             mods=mods,
             user=UserProfile(user_id=int(self.session.auth.entity_id), user_token=self.session.auth.token),
         )
-        ygg_data = YggdrasilData(
-            launcher_version=FORCED_YGG_LAUNCHER_VERSION or self.session.client.game_version,
-            channel="netease",
+        ygg_data = build_runtime_ygg_data(
+            client_game_version=self.session.client.game_version,
             crc_salt=crc_salt,
         )
         self._logger.info("ProxyPhase ygg profile ready %.1fms", (time.perf_counter() - t0) * 1000)
@@ -1859,7 +1806,14 @@ class MainWindow(QtWidgets.QMainWindow):
             profile, ygg_data = self._build_ygg_profile(include_mods=False)
             ygg = StandardYggdrasil.with_random_server(ygg_data)
             ok, err = ygg.join_server(profile, server_id)
-            return ok, err or ""
+            if ok:
+                return True, ""
+            backend = self._get_auth_backend(self.settings.get("auth_base_url", "https://api.taylorswift.fit"))
+            response = backend.authenticated(server_id, build_fantnel_profile_payload(profile))
+            if is_backend_authenticated_success(response):
+                return True, ""
+            message = str(response.get("message") or response.get("msg") or response.get("error") or err or "加入失败")
+            return False, message
 
         def on_success(result: tuple[bool, str]) -> None:
             ok, err = result
@@ -1927,6 +1881,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 game_id=self.session.server.entity_id,
                 ygg_profile=profile,
                 ygg_data=ygg_data,
+                auth_base_url=self.settings.get("auth_base_url", "https://api.taylorswift.fit"),
             )
             self._logger.info(
                 "Proxy config ready listen=%s:%s forward=%s:%s",

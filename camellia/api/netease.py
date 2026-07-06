@@ -20,7 +20,8 @@ from .x19 import get_latest_version
 
 MPAY_BASE = "https://service.mkey.163.com"
 PROJECT_ID = "aecfrxodyqaaaajp-g-x19"
-DEFAULT_SDK_VERSION = "4.2.0"
+DEFAULT_SDK_VERSION = "4.17.2"
+DEFAULT_APP_CHANNEL = "a50_sdk_cn"
 DEFAULT_AIM_INFO = "{\"aim\":\"127.0.0.1\",\"country\":\"CN\",\"tz\":\"+0800\",\"tzid\":\"\"}"
 
 
@@ -80,6 +81,7 @@ class MPayClient:
             {
                 "device_id": device.device_id,
                 "mobile": phone_number,
+                "urs_udid": self._unique_id,
             }
         )
         resp = self._client.post_form("/mpay/api/users/login/mobile/get_sms", params)
@@ -95,6 +97,8 @@ class MPayClient:
                 "device_id": device.device_id,
                 "mobile": phone_number,
                 "smscode": code,
+                "login_for": "1",
+                "urs_udid": self._unique_id,
                 "up_content": "",
             }
         )
@@ -110,8 +114,10 @@ class MPayClient:
         params.update(
             {
                 "device_id": device.device_id,
+                "login_for": "1",
                 "opt_fields": "nickname,avatar,realname_status,mobile_bind_status,mask_related_mobile,related_login_status",
                 "ticket": ticket,
+                "urs_udid": self._unique_id,
             }
         )
         encoded = _encode_base64(phone_number)
@@ -139,7 +145,7 @@ class MPayClient:
             "app_mode": "2",
             "app_type": "games",
             "arch": "win_x64",
-            "cv": "c4.2.0",
+            "cv": f"c{DEFAULT_SDK_VERSION}",
             "mcount_app_key": "EEkEEXLymcNjM42yLY3Bn6AO15aGy4yq",
             "mcount_transaction_id": "0",
             "process_id": str(os.getpid()),
@@ -202,18 +208,24 @@ class MPayClient:
         return unique_id
 
 
-def build_sauth_json(user_id: str, token: str, device_id: str) -> str:
+def build_sauth_json(user_id: str, token: str, device_id: str, *, login_channel: str = "netease") -> str:
     payload = {
         "gameid": "x19",
-        "login_channel": "netease",
-        "app_channel": "netease",
+        "login_channel": login_channel or "netease",
+        "app_channel": DEFAULT_APP_CHANNEL,
         "platform": "pc",
         "sdkuid": user_id,
         "sessionid": token,
         "sdk_version": DEFAULT_SDK_VERSION,
-        "udid": uuid.uuid4().hex.upper(),
+        "udid": device_id,
         "deviceid": device_id,
         "aim_info": DEFAULT_AIM_INFO,
+        "client_login_sn": uuid.uuid4().hex.upper(),
+        "gas_token": "",
+        "extra_channel": "",
+        "source_platform": "pc",
+        "ip": "",
+        "get_access_token": "1",
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -226,9 +238,15 @@ def login_with_netease_email(email: str, password: str) -> str:
     user = wrapper.get("user") or {}
     user_id = user.get("id")
     token = user.get("token")
+    login_channel = user.get("login_channel") or "netease"
     if not user_id or not token:
         raise NeteaseLoginError("网易邮箱登录失败")
-    return build_sauth_json(user_id, token, client.device.device_id if client.device else "")
+    return build_sauth_json(
+        user_id,
+        token,
+        client.device.device_id if client.device else "",
+        login_channel=login_channel,
+    )
 
 
 def send_netease_sms(phone_number: str) -> bool:
@@ -250,9 +268,15 @@ def login_with_netease_phone(phone_number: str, code: str) -> str:
     user = user_wrapper.get("user") or {}
     user_id = user.get("id")
     token = user.get("token")
+    login_channel = user.get("login_channel") or "netease"
     if not user_id or not token:
         raise NeteaseLoginError("手机号登录失败")
-    return build_sauth_json(user_id, token, client.device.device_id if client.device else "")
+    return build_sauth_json(
+        user_id,
+        token,
+        client.device.device_id if client.device else "",
+        login_channel=login_channel,
+    )
 
 
 def _format_mpay_error(status: int, body: str, *, fallback: str) -> str:

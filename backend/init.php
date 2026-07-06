@@ -61,7 +61,6 @@ foreach ([
     'enable_register',
     'enable_activation',
     'bootstrap_admin',
-    'crc_auth_token',
 ] as $key) {
     if (isset($input[$key])) {
         set_config_value($pdo, $key, (string)$input[$key]);
@@ -155,10 +154,6 @@ $config = get_config_map($pdo);
                     <input name="admin_allow_ip" value="<?= htmlspecialchars($config['admin_allow_ip'] ?? '') ?>"/>
                 </div>
                 <div>
-                    <label>CRC Auth Token</label>
-                    <input name="crc_auth_token" placeholder="填你的 CRC token" />
-                </div>
-                <div>
                     <label>Access TTL（秒）</label>
                     <input name="access_ttl" value="<?= htmlspecialchars($config['access_ttl'] ?? '3600') ?>"/>
                 </div>
@@ -222,7 +217,7 @@ $config = get_config_map($pdo);
         <tbody>
         <?php foreach ($config as $key => $value) :
             $safe = $value;
-            if (in_array($key, ['jwt_secret','admin_pass_hash','admin_token','crc_auth_token'], true)) {
+            if (in_array($key, ['jwt_secret','admin_pass_hash','admin_token'], true)) {
                 $safe = mask_value((string)$value);
             }
             ?>
@@ -236,7 +231,7 @@ $config = get_config_map($pdo);
 
     <h3>快速初始化示例</h3>
     <p class="muted">通过参数设置（示例）：</p>
-    <code>?admin_user=admin&amp;admin_pass=admin123&amp;admin_allow_ip=104.245.12.20&amp;crc_auth_token=YOUR_TOKEN</code>
+    <code>?admin_user=admin&amp;admin_pass=admin123&amp;admin_allow_ip=104.245.12.20</code>
 </div>
 </body>
 </html>

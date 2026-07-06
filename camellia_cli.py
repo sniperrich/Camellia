@@ -56,15 +56,11 @@ X19_PATCH_LIST_URL = "https://x19.update.netease.com/pl/x19_java_patchlist"
 X19_AUTH_SERVER_LIST = "https://x19.update.netease.com/authserver.list"
 MGBSDK_BASE = "https://mgbsdk.matrix.netease.com"
 
-# Camellia's CRC salt service (primary) + legacy fallback.
-FANTNEL_INFO_URL = "http://crcsalt.taylorswift.fit/"
-FANTNEL_INFO_FALLBACK_URL = "http://110.42.70.32:13423/fantnel.json"
-
 DEFAULT_API_USER_AGENT = "WPFLauncher/0.0.0.0"
 
 # Locked configuration for this standalone CLI build.
 SUPPORTED_MC_VERSION = "1.8.9"
-FIXED_CRC_SALT = "421C4417360637BA22478129C9AFB8C5"
+FIXED_CRC_SALT = "E77652A5A6FE19810998B02347F2D805"
 
 
 # -----------------------------------------------------------------------------

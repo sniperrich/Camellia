@@ -34,6 +34,8 @@ from .protocol import (
     write_varint,
 )
 from .yggdrasil import GameProfile, StandardYggdrasil, UserProfile, YggdrasilData
+from .ygg_auth import build_fantnel_profile_payload, is_backend_authenticated_success
+from ..api.auth_backend import AuthBackend
 from ..plugins.events import (
     AnimationEvent,
     ChatMessageEvent,
@@ -87,6 +89,7 @@ class ProxyConfig:
     game_id: Optional[str] = None
     ygg_profile: Optional[GameProfile] = None
     ygg_data: Optional[YggdrasilData] = None
+    auth_base_url: Optional[str] = None
 
 
 class _Cfb8Cipher:
@@ -1080,7 +1083,7 @@ class _ProxySession:
 
         if self.config.ygg_profile and self.config.ygg_data:
             self._phase(f"yggdrasil join server_hash={server_hash[:12]}...")
-            await self._join_yggdrasil(server_hash)
+            await self._join_yggdrasil(server_hash, server_id)
         else:
             self.logger.warning("Yggdrasil profile missing; skipping join")
             self._phase("yggdrasil join skipped (missing profile)")
@@ -1409,7 +1412,7 @@ class _ProxySession:
             return value
         return value[:max_len]
 
-    async def _join_yggdrasil(self, server_hash: str) -> None:
+    async def _join_yggdrasil(self, server_hash: str, server_id: str = "") -> None:
         profile = self.config.ygg_profile
         data = self.config.ygg_data
         if profile is None or data is None:
@@ -1477,9 +1480,33 @@ class _ProxySession:
                         port,
                         err,
                     )
+        backend_ok, backend_err = await asyncio.to_thread(
+            self._fallback_backend_authenticated,
+            _resolve_backend_authenticated_server_id(server_id, server_hash),
+            profile,
+        )
+        if backend_ok:
+            self.logger.info("Yggdrasil backend authenticated fallback success")
+            return
         self.logger.warning("Yggdrasil join failed across all strategies")
         if failures:
             self.logger.warning("Yggdrasil auth failed list (%d): %s", len(failures), _summarize(failures))
+        if backend_err:
+            self.logger.warning("Yggdrasil backend auth fallback failed: %s", backend_err)
+
+    def _fallback_backend_authenticated(self, auth_server_id: str, profile: GameProfile) -> tuple[bool, str]:
+        base_url = (self.config.auth_base_url or "").strip()
+        if not base_url:
+            return False, "missing auth backend url"
+        try:
+            backend = AuthBackend(base_url)
+            response = backend.authenticated(auth_server_id, build_fantnel_profile_payload(profile))
+        except Exception as exc:  # pylint: disable=broad-except
+            return False, str(exc)
+        if is_backend_authenticated_success(response):
+            return True, ""
+        message = str(response.get("message") or response.get("msg") or response.get("error") or "backend rejected auth")
+        return False, message
 
     @staticmethod
     def _build_auth_strategies(profile: GameProfile) -> list[tuple[str, GameProfile]]:
@@ -1607,3 +1634,10 @@ def _looks_like_hex_32(value: str) -> bool:
     if len(value) != 32:
         return False
     return all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def _resolve_backend_authenticated_server_id(server_id: str, server_hash: str) -> str:
+    resolved = (server_id or "").strip()
+    if resolved:
+        return resolved
+    return (server_hash or "").strip()

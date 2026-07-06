@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.parse
 from typing import Any, Dict, Optional
 
 from .http_client import HttpClient, HttpResponse, load_cookie_jar
@@ -116,3 +117,7 @@ class AuthBackend:
             "/auth/refresh",
             {"refresh_token": refresh_token, "device_id": device_id},
         )
+
+    def authenticated(self, server_id: str, profile_payload: Dict[str, Any]) -> Dict[str, Any]:
+        quoted = urllib.parse.quote(str(server_id or ""), safe="")
+        return self._request("POST", f"/api/fantnel/authenticated?id={quoted}", profile_payload)

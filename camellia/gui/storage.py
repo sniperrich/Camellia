@@ -66,15 +66,14 @@ class SavedAccount:
         remember: bool = False,
         remark: str = "",
     ) -> "SavedAccount":
-        sub_mode = "password" if login_mode == "password" else "sms"
         return cls(
             id=str(uuid.uuid4()),
             mode="netease_phone",
             username=phone,
-            password=password if remember else "",
+            password="",
             remark=remark,
-            sub_mode=sub_mode,
-            remember_password=remember,
+            sub_mode="sms",
+            remember_password=False,
             last_used=time.time(),
         )
 
@@ -117,8 +116,7 @@ class SavedAccount:
             return f"{base} · {self.remark}" if self.remark else base
         if self.mode == "netease_phone":
             name = self.username or "未知账号"
-            prefix = "网易手机号（密码）" if self.sub_mode == "password" else "网易手机号"
-            base = f"{prefix}：{name}"
+            base = f"网易手机号：{name}"
             return f"{base} · {self.remark}" if self.remark else base
         if self.mode == "sauth":
             name = self.username or "SAuth"
